@@ -61,16 +61,34 @@ class BitrixClient:
         transcript = str(result.get("transcription", "")).strip()
         return transcript or None
 
-    def resolve_deal_field(self, display_name: str) -> DealField:
+    def resolve_deal_field(self, display_name: str, configured_field_name: str = "") -> DealField:
         fields = self.call("crm.deal.userfield.list", {"order": {"ID": "ASC"}})
+        if configured_field_name:
+            for field in fields:
+                if field.get("FIELD_NAME") == configured_field_name:
+                    return self._deal_field_from_details(self.call("crm.deal.userfield.get", {"id": field["ID"]}))
+            raise RuntimeError(f"Не найден код поля сделки: {configured_field_name}")
         target = display_name.casefold()
         for field in fields:
-            labels = [field.get("EDIT_FORM_LABEL"), field.get("LIST_COLUMN_LABEL"), field.get("USER_TYPE_ID")]
-            if any(str(label or "").casefold() == target for label in labels):
-                enum = {
-                    str(item.get("VALUE", "")).casefold(): str(item["ID"])
-                    for item in field.get("LIST", [])
-                    if item.get("VALUE") and item.get("ID")
-                }
-                return DealField(field["FIELD_NAME"], field.get("USER_TYPE_ID", "string"), enum)
+            details = self.call("crm.deal.userfield.get", {"id": field["ID"]})
+            labels = [_localized(details.get("EDIT_FORM_LABEL")), _localized(details.get("LIST_COLUMN_LABEL"))]
+            if any(label.casefold() == target for label in labels):
+                return self._deal_field_from_details(details)
         raise RuntimeError(f"Не найдено поле сделки: {display_name}")
+
+    @staticmethod
+    def _deal_field_from_details(field: dict[str, Any]) -> DealField:
+        enum = {
+            str(item.get("VALUE", "")).casefold(): str(item["ID"])
+            for item in field.get("LIST", [])
+            if item.get("VALUE") and item.get("ID")
+        }
+        return DealField(field["FIELD_NAME"], field.get("USER_TYPE_ID", "string"), enum)
+
+
+def _localized(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get("ru") or value.get("en") or "")
+    return ""

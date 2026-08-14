@@ -12,6 +12,8 @@ class Config:
     openai_model: str = "gpt-5.6-luna"
     category_field_name: str = "Категория товаров (Сайт)"
     subcategory_field_name: str = "Подкатегория товаров (Сайт)"
+    category_field_id: str = ""
+    subcategory_field_id: str = ""
     webhook_secret: str = ""
     title_max_length: int = 100
     http_timeout: int = 45
@@ -33,8 +35,9 @@ class Config:
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.6-luna"),
             category_field_name=os.getenv("CATEGORY_FIELD_NAME", "Категория товаров (Сайт)"),
             subcategory_field_name=os.getenv("SUBCATEGORY_FIELD_NAME", "Подкатегория товаров (Сайт)"),
+            category_field_id=os.getenv("CATEGORY_FIELD_ID", ""),
+            subcategory_field_id=os.getenv("SUBCATEGORY_FIELD_ID", ""),
             webhook_secret=os.getenv("WEBHOOK_SECRET", ""),
             title_max_length=int(os.getenv("TITLE_MAX_LENGTH", "100")),
             http_timeout=int(os.getenv("HTTP_TIMEOUT", "45")),
         )
-

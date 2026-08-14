@@ -19,13 +19,15 @@ class ProcessingResult:
 
 
 class CallProcessingService:
-    def __init__(self, bitrix: BitrixClient, analyzer: OpenAIAnalyzer, groups: list[ProductGroup], category_field_name: str, subcategory_field_name: str, title_max_length: int = 100):
+    def __init__(self, bitrix: BitrixClient, analyzer: OpenAIAnalyzer, groups: list[ProductGroup], category_field_name: str, subcategory_field_name: str, title_max_length: int = 100, category_field_id: str = "", subcategory_field_id: str = ""):
         self.bitrix = bitrix
         self.analyzer = analyzer
         self.groups = groups
         self.category_field_name = category_field_name
         self.subcategory_field_name = subcategory_field_name
         self.title_max_length = title_max_length
+        self.category_field_id = category_field_id
+        self.subcategory_field_id = subcategory_field_id
 
     def process(self, deal_id: int, transcript: str, dry_run: bool = False) -> ProcessingResult:
         transcript = " ".join(transcript.split())
@@ -35,8 +37,8 @@ class CallProcessingService:
         analysis = self.analyzer.analyze(transcript, self.groups)
         fields: dict[str, str] = {"TITLE": analysis.title.strip()[: self.title_max_length]}
         if analysis.product_specific and analysis.category and analysis.subcategory:
-            category_field = self.bitrix.resolve_deal_field(self.category_field_name)
-            subcategory_field = self.bitrix.resolve_deal_field(self.subcategory_field_name)
+            category_field = self.bitrix.resolve_deal_field(self.category_field_name, self.category_field_id)
+            subcategory_field = self.bitrix.resolve_deal_field(self.subcategory_field_name, self.subcategory_field_id)
             fields[category_field.field_name] = category_field.encode(analysis.category)
             fields[subcategory_field.field_name] = subcategory_field.encode(analysis.subcategory)
         if not dry_run:

@@ -22,7 +22,7 @@ class FakeBackfillBitrix:
     def get_call_transcript(self, activity_id):
         return None if activity_id == 20 else "Клиенту требуется болгарский электрический тельфер грузоподъемностью одна тонна."
 
-    def resolve_deal_field(self, name):
+    def resolve_deal_field(self, name, configured_field_name=""):
         return DealField("UF_" + name, "string", {})
 
     def update_deal(self, deal_id, fields):

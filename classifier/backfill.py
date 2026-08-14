@@ -25,6 +25,8 @@ def main() -> None:
         config.category_field_name,
         config.subcategory_field_name,
         config.title_max_length,
+        config.category_field_id,
+        config.subcategory_field_id,
     )
     result = service.process_existing_deal(args.deal_id, dry_run=not args.write)
     print(json.dumps({

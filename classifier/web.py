@@ -21,6 +21,8 @@ service = CallProcessingService(
     config.category_field_name,
     config.subcategory_field_name,
     config.title_max_length,
+    config.category_field_id,
+    config.subcategory_field_id,
 )
 app = FastAPI(title="Bitrix24 Call Summarizer")
 
