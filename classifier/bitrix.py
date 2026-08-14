@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from datetime import datetime
 import json
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -45,21 +46,31 @@ class BitrixClient:
 
     def get_deal_products(self, deal_id: int) -> list[DealProduct]:
         rows = self._call("crm.deal.productrows.get", {"id": deal_id}) or []
-        return [
-            DealProduct(
-                product_id=str(row.get("PRODUCT_ID", "")),
-                xml_id=str(row.get("PRODUCT_XML_ID", "")),
-                name=str(row.get("PRODUCT_NAME", "")),
-                price=Decimal(str(row.get("PRICE", 0))),
-                quantity=Decimal(str(row.get("QUANTITY", 0))),
+        products: list[DealProduct] = []
+        for row in rows:
+            name = str(row.get("PRODUCT_NAME", ""))
+            xml_id = str(row.get("PRODUCT_XML_ID", ""))
+            site_id = re.search(r"\(ID\s+(\d+)\)\s*$", name, re.IGNORECASE)
+            if not xml_id and site_id:
+                xml_id = site_id.group(1)
+                name = name[: site_id.start()].rstrip()
+            products.append(
+                DealProduct(
+                    product_id=str(row.get("PRODUCT_ID", "")),
+                    xml_id=xml_id,
+                    name=name,
+                    price=Decimal(str(row.get("PRICE", 0))),
+                    quantity=Decimal(str(row.get("QUANTITY", 0))),
+                )
             )
-            for row in rows
-        ]
+        return products
 
     def update_deal(self, deal_id: int, fields: dict[str, str]) -> None:
         self._call("crm.deal.update", {"id": deal_id, "fields": fields})
 
-    def list_deals_created(self, date_from: datetime, date_to: datetime) -> list[int]:
+    def list_deals_created(
+        self, date_from: datetime, date_to: datetime, limit: int | None = None
+    ) -> list[int]:
         deal_ids: list[int] = []
         start = 0
         while True:
@@ -76,6 +87,8 @@ class BitrixClient:
                 },
             ) or []
             deal_ids.extend(int(row["ID"]) for row in rows)
+            if limit is not None and len(deal_ids) >= limit:
+                return deal_ids[:limit]
             if len(rows) < 50:
                 return deal_ids
             start += len(rows)
