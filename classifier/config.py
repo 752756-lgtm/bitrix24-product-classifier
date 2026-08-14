@@ -1,35 +1,41 @@
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 
-def _json_map(name: str) -> dict[str, str]:
-    raw = os.getenv(name, "{}")
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError(f"{name} must be a JSON object")
-    return {str(key): str(item) for key, item in value.items()}
+def _load_dotenv(path: Path = Path(".env")) -> None:
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 @dataclass(frozen=True)
 class Settings:
     bitrix_webhook_url: str
     yml_url: str
-    category_field_id: str
-    subcategory_field_id: str
+    category_field_title: str
+    subcategory_field_title: str
     timeout: float = 30.0
-    category_value_map: dict[str, str] = field(default_factory=dict)
-    subcategory_value_map: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Settings":
+        _load_dotenv()
         required = {
             "BITRIX_WEBHOOK_URL": os.getenv("BITRIX_WEBHOOK_URL", "").strip(),
             "YML_URL": os.getenv("YML_URL", "").strip(),
-            "CATEGORY_FIELD_ID": os.getenv("CATEGORY_FIELD_ID", "").strip(),
-            "SUBCATEGORY_FIELD_ID": os.getenv("SUBCATEGORY_FIELD_ID", "").strip(),
+            "CATEGORY_FIELD_TITLE": os.getenv(
+                "CATEGORY_FIELD_TITLE", "Категория товаров (Сайт)"
+            ).strip(),
+            "SUBCATEGORY_FIELD_TITLE": os.getenv(
+                "SUBCATEGORY_FIELD_TITLE", "Подкатегория товаров (Сайт)"
+            ).strip(),
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
@@ -37,10 +43,7 @@ class Settings:
         return cls(
             bitrix_webhook_url=required["BITRIX_WEBHOOK_URL"],
             yml_url=required["YML_URL"],
-            category_field_id=required["CATEGORY_FIELD_ID"],
-            subcategory_field_id=required["SUBCATEGORY_FIELD_ID"],
+            category_field_title=required["CATEGORY_FIELD_TITLE"],
+            subcategory_field_title=required["SUBCATEGORY_FIELD_TITLE"],
             timeout=float(os.getenv("HTTP_TIMEOUT", "30")),
-            category_value_map=_json_map("CATEGORY_VALUE_MAP"),
-            subcategory_value_map=_json_map("SUBCATEGORY_VALUE_MAP"),
         )
-
