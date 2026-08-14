@@ -44,7 +44,16 @@ class ClassifierTests(unittest.TestCase):
         offer = parse_yml(content).find("sku-1", "")
         self.assertEqual((offer.category, offer.subcategory), ("Warehouse", "Pallet trucks"))
 
+    def test_normalizes_bitrix_category_names(self):
+        content = '''<yml_catalog><shop><categories>
+          <category id="29">Станки</category>
+          <category id="301" parentId="29">Металлообрабатывающие станки</category>
+          <category id="990" parentId="301">Ленточнопильные станки по металлу</category>
+        </categories><offers><offer id="1"><name>Saw</name><categoryId>990</categoryId>
+        </offer></offers></shop></yml_catalog>'''.encode()
+        offer = parse_yml(content).find("1", "")
+        self.assertEqual((offer.category, offer.subcategory), ("Станки по металлу", "Ленточнопильные станки"))
+
 
 if __name__ == "__main__":
     unittest.main()
-
