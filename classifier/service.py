@@ -18,16 +18,19 @@ def classify_deal(settings: Settings, deal_id: int, dry_run: bool = False) -> Cl
         result = classify_products(bitrix.get_deal_products(deal_id), catalog)
         if result is None or dry_run:
             return result
-        category = settings.category_value_map.get(result.category, result.category)
-        subcategory = settings.subcategory_value_map.get(result.subcategory, result.subcategory)
+        category_field, category = bitrix.resolve_enumeration_value(
+            settings.category_field_title, result.category
+        )
+        subcategory_field, subcategory = bitrix.resolve_enumeration_value(
+            settings.subcategory_field_title, result.subcategory
+        )
         bitrix.update_deal(
             deal_id,
             {
-                settings.category_field_id: category,
-                settings.subcategory_field_id: subcategory,
+                category_field: category,
+                subcategory_field: subcategory,
             },
         )
         return result
     finally:
         bitrix.close()
-
