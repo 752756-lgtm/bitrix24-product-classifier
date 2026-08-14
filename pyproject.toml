@@ -7,4 +7,3 @@ dependencies = ["httpx>=0.27,<1"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-
