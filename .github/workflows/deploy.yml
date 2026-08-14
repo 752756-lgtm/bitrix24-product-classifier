@@ -80,6 +80,26 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
 
+      - name: Verify SSH authentication
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(
+            -o StrictHostKeyChecking=accept-new
+            -o ConnectTimeout=15
+            -o ConnectionAttempts=1
+            -o PreferredAuthentications=password,keyboard-interactive
+            -o PasswordAuthentication=yes
+            -o KbdInteractiveAuthentication=yes
+            -o PubkeyAuthentication=no
+            -o NumberOfPasswordPrompts=1
+            -o ServerAliveInterval=10
+            -o ServerAliveCountMax=2
+          )
+          timeout --signal=TERM 30s sshpass -e ssh "${ssh_options[@]}" "${SERVER_USER}@${SERVER_HOST}" "printf 'SSH authentication succeeded\\n'"
+
       - name: Upload package
         shell: bash
         env:
@@ -87,9 +107,20 @@ jobs:
         run: |
           set -Eeuo pipefail
           remote_base="/tmp/bitrix24-call-summarizer-${GITHUB_RUN_ID}"
-          ssh_options=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
-          sshpass -e scp "${ssh_options[@]}" bitrix24-call-summarizer.tar.gz "${SERVER_USER}@${SERVER_HOST}:${remote_base}.tar.gz"
-          sshpass -e scp "${ssh_options[@]}" runtime.env "${SERVER_USER}@${SERVER_HOST}:${remote_base}.env"
+          ssh_options=(
+            -o StrictHostKeyChecking=accept-new
+            -o ConnectTimeout=15
+            -o ConnectionAttempts=1
+            -o PreferredAuthentications=password,keyboard-interactive
+            -o PasswordAuthentication=yes
+            -o KbdInteractiveAuthentication=yes
+            -o PubkeyAuthentication=no
+            -o NumberOfPasswordPrompts=1
+            -o ServerAliveInterval=10
+            -o ServerAliveCountMax=2
+          )
+          timeout --signal=TERM 45s sshpass -e scp "${ssh_options[@]}" bitrix24-call-summarizer.tar.gz "${SERVER_USER}@${SERVER_HOST}:${remote_base}.tar.gz"
+          timeout --signal=TERM 45s sshpass -e scp "${ssh_options[@]}" runtime.env "${SERVER_USER}@${SERVER_HOST}:${remote_base}.env"
 
       - name: Dry-run deal and deploy
         shell: bash
@@ -98,7 +129,18 @@ jobs:
         run: |
           set -Eeuo pipefail
           remote_base="/tmp/bitrix24-call-summarizer-${GITHUB_RUN_ID}"
-          ssh_options=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+          ssh_options=(
+            -o StrictHostKeyChecking=accept-new
+            -o ConnectTimeout=15
+            -o ConnectionAttempts=1
+            -o PreferredAuthentications=password,keyboard-interactive
+            -o PasswordAuthentication=yes
+            -o KbdInteractiveAuthentication=yes
+            -o PubkeyAuthentication=no
+            -o NumberOfPasswordPrompts=1
+            -o ServerAliveInterval=10
+            -o ServerAliveCountMax=2
+          )
           sshpass -e ssh "${ssh_options[@]}" "${SERVER_USER}@${SERVER_HOST}" \
             "bash -s -- '${remote_base}.tar.gz' '${remote_base}.env' '${DEAL_ID}' '${GITHUB_SHA}'" <<'REMOTE'
           set -Eeuo pipefail
