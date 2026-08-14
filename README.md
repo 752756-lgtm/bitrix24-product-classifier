@@ -61,6 +61,32 @@ python -m classifier.backfill --deal-id 314319
 python -m classifier.backfill --deal-id 314319 --write
 ```
 
+## Ручное развёртывание через GitHub Actions
+
+Workflow `.github/workflows/deploy.yml` запускается только вручную. Перед заменой контейнера он:
+
+1. проверяет конфигурацию;
+2. запускает тесты;
+3. собирает новый Docker-образ на сервере;
+4. выполняет обязательный dry-run указанной сделки без записи в CRM;
+5. запускает сервис и проверяет `/health`;
+6. при неуспешной проверке пытается вернуть предыдущий образ.
+
+Один раз добавьте в `Settings → Secrets and variables → Actions` следующие Repository secrets:
+
+| Secret | Значение |
+|---|---|
+| `SERVER_HOST` | IP или домен сервера |
+| `SERVER_USER` | SSH-пользователь |
+| `SERVER_PASSWORD` | SSH-пароль; хранится только в GitHub Secrets |
+| `BITRIX_WEBHOOK_URL` | базовый URL входящего вебхука Битрикс24 |
+| `OPENAI_API_KEY` | ключ OpenAI API |
+| `WEBHOOK_SECRET` | отдельная длинная случайная строка для защиты HTTP endpoint |
+
+После попадания workflow в основную ветку откройте `Actions → Deploy call summarizer → Run workflow`, укажите ID сделки и запустите. По умолчанию используется `314319`. Workflow не содержит режима `--write` и не изменяет CRM.
+
+Сервис публикуется только на `127.0.0.1:8080`. Для приема событий Битрикс24 нужен HTTPS reverse proxy; его следует включать отдельно после успешного dry-run.
+
 ## Переменные окружения
 
 | Переменная | Назначение |
