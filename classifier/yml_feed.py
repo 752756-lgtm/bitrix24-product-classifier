@@ -50,7 +50,22 @@ def parse_yml(content: bytes) -> YmlCatalog:
         names.reverse()
         if not names:
             return "", ""
-        return names[0], names[-1] if len(names) > 1 else ""
+        category = names[0]
+        subcategory = names[-1] if len(names) > 1 else ""
+        category_aliases = {
+            "Вилочные погрузчики": "Складская техника",
+        }
+        if category == "Станки" and len(names) > 1:
+            if names[1] == "Металлообрабатывающие станки":
+                category = "Станки по металлу"
+            elif names[1] == "Деревообрабатывающие станки":
+                category = "Станки по дереву"
+        category = category_aliases.get(category, category)
+        subcategory_aliases = {
+            "Ленточнопильные станки по металлу": "Ленточнопильные станки",
+        }
+        subcategory = subcategory_aliases.get(subcategory, subcategory)
+        return category, subcategory
 
     offers: list[Offer] = []
     for item in root.findall(".//offers/offer"):
@@ -60,4 +75,3 @@ def parse_yml(content: bytes) -> YmlCatalog:
         if offer_id and name and category:
             offers.append(Offer(offer_id, name, category, subcategory))
     return YmlCatalog(offers)
-
