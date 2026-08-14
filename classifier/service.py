@@ -62,9 +62,7 @@ def classify_period(
     bitrix = BitrixClient(settings.bitrix_webhook_url, settings.timeout)
     results: list[tuple[int, Classification | None, str | None]] = []
     try:
-        deal_ids = bitrix.list_deals_created(date_from, date_to)
-        if limit is not None:
-            deal_ids = deal_ids[:limit]
+        deal_ids = bitrix.list_deals_created(date_from, date_to, limit)
         for deal_id in deal_ids:
             try:
                 result = classify_products(bitrix.get_deal_products(deal_id), catalog)
