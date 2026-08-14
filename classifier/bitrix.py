@@ -12,6 +12,10 @@ class BitrixError(RuntimeError):
     pass
 
 
+def _normalized(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
 class BitrixClient:
     def __init__(self, webhook_url: str, timeout: float = 30.0) -> None:
         self.webhook_url = webhook_url.rstrip("/") + "/"
@@ -44,3 +48,23 @@ class BitrixClient:
     def update_deal(self, deal_id: int, fields: dict[str, str]) -> None:
         self._call("crm.deal.update", {"id": deal_id, "fields": fields})
 
+    def resolve_enumeration_value(self, field_title: str, value: str) -> tuple[str, str]:
+        fields = self._call("crm.deal.fields", {}) or {}
+        wanted_title = _normalized(field_title)
+        for field_id, field in fields.items():
+            labels = [
+                field.get("title", ""),
+                field.get("formLabel", ""),
+                field.get("filterLabel", ""),
+                field.get("listLabel", ""),
+            ]
+            if wanted_title not in {_normalized(str(label)) for label in labels if label}:
+                continue
+            if field.get("type") != "enumeration":
+                raise BitrixError(f"Field {field_title!r} is not an enumeration")
+            wanted_value = _normalized(value)
+            for item in field.get("items", []):
+                if _normalized(str(item.get("VALUE", ""))) == wanted_value:
+                    return field_id, str(item["ID"])
+            raise BitrixError(f"Value {value!r} is missing from field {field_title!r}")
+        raise BitrixError(f"Deal field {field_title!r} was not found")
