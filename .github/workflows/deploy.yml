@@ -1,0 +1,166 @@
+name: Deploy call summarizer
+
+on:
+  workflow_dispatch:
+    inputs:
+      deal_id:
+        description: "ID сделки для обязательной проверки без записи"
+        required: true
+        default: "314319"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bitrix24-call-summarizer-production
+  cancel-in-progress: false
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+      DEAL_ID: ${{ inputs.deal_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          missing=0
+          for name in SERVER_HOST SERVER_USER SERVER_PASSWORD BITRIX_WEBHOOK_URL OPENAI_API_KEY WEBHOOK_SECRET; do
+            if [ -z "${!name}" ]; then
+              echo "::error::GitHub Secret ${name} is not configured"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m unittest discover -s tests -v
+          python -m compileall -q classifier tests
+
+      - name: Prepare deployment package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tar -czf bitrix24-call-summarizer.tar.gz Dockerfile requirements.txt classifier
+          umask 077
+          {
+            printf 'BITRIX_WEBHOOK_URL=%s\n' "${BITRIX_WEBHOOK_URL}"
+            printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY}"
+            printf 'OPENAI_MODEL=%s\n' 'gpt-5.6-luna'
+            printf 'YML_URL=%s\n' 'https://100kwatt.ru/ab__pfe_34_testtt.yml'
+            printf 'CATEGORY_FIELD_NAME=%s\n' 'Категория товаров (Сайт)'
+            printf 'SUBCATEGORY_FIELD_NAME=%s\n' 'Подкатегория товаров (Сайт)'
+            printf 'CATEGORY_FIELD_ID=%s\n' 'UF_CRM_1776320088319'
+            printf 'SUBCATEGORY_FIELD_ID=%s\n' 'UF_CRM_1568228872884'
+            printf 'WEBHOOK_SECRET=%s\n' "${WEBHOOK_SECRET}"
+            printf 'HTTP_TIMEOUT=%s\n' '45'
+            printf 'TITLE_MAX_LENGTH=%s\n' '100'
+          } > runtime.env
+
+      - name: Install SSH client
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Upload package
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          remote_base="/tmp/bitrix24-call-summarizer-${GITHUB_RUN_ID}"
+          ssh_options=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+          sshpass -e scp "${ssh_options[@]}" bitrix24-call-summarizer.tar.gz "${SERVER_USER}@${SERVER_HOST}:${remote_base}.tar.gz"
+          sshpass -e scp "${ssh_options[@]}" runtime.env "${SERVER_USER}@${SERVER_HOST}:${remote_base}.env"
+
+      - name: Dry-run deal and deploy
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          remote_base="/tmp/bitrix24-call-summarizer-${GITHUB_RUN_ID}"
+          ssh_options=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+          sshpass -e ssh "${ssh_options[@]}" "${SERVER_USER}@${SERVER_HOST}" \
+            "bash -s -- '${remote_base}.tar.gz' '${remote_base}.env' '${DEAL_ID}' '${GITHUB_SHA}'" <<'REMOTE'
+          set -Eeuo pipefail
+          archive="$1"
+          env_source="$2"
+          deal_id="$3"
+          commit_sha="$4"
+          app_dir="/opt/bitrix24-call-summarizer"
+          container="bitrix24-call-summarizer"
+          image="bitrix24-call-summarizer:${commit_sha}"
+
+          install -d -m 700 "${app_dir}"
+          tar -xzf "${archive}" -C "${app_dir}"
+          install -m 600 "${env_source}" "${app_dir}/.env"
+          cd "${app_dir}"
+
+          docker build --pull -t "${image}" .
+
+          echo "Running mandatory dry-run for deal ${deal_id}"
+          docker run --rm --env-file .env "${image}" \
+            python -m classifier.backfill --deal-id "${deal_id}"
+
+          previous_image="$(docker inspect -f '{{.Config.Image}}' "${container}" 2>/dev/null || true)"
+          docker rm -f "${container}" >/dev/null 2>&1 || true
+          docker run -d \
+            --name "${container}" \
+            --restart unless-stopped \
+            --env-file .env \
+            -p 127.0.0.1:8080:8080 \
+            "${image}"
+
+          healthy=0
+          for _ in $(seq 1 20); do
+            if docker exec "${container}" python -c \
+              "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3))['status']=='ok'" \
+              >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${healthy}" -ne 1 ]; then
+            docker logs "${container}" || true
+            docker rm -f "${container}" >/dev/null 2>&1 || true
+            if [ -n "${previous_image}" ]; then
+              docker run -d \
+                --name "${container}" \
+                --restart unless-stopped \
+                --env-file .env \
+                -p 127.0.0.1:8080:8080 \
+                "${previous_image}" || true
+            fi
+            echo "Health check failed; deployment rolled back"
+            exit 1
+          fi
+
+          rm -f "${archive}" "${env_source}"
+          echo "Deployment succeeded; CRM was not modified"
+          REMOTE
+
+      - name: Remove local secret file
+        if: always()
+        shell: bash
+        run: rm -f runtime.env
