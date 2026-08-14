@@ -44,6 +44,23 @@ class BitrixClient:
     def get_activity(self, activity_id: int) -> dict[str, Any]:
         return self.call("crm.activity.get", {"id": activity_id})
 
+    def list_deal_calls(self, deal_id: int) -> list[dict[str, Any]]:
+        return self.call(
+            "crm.activity.list",
+            {
+                "order": {"END_TIME": "DESC", "ID": "DESC"},
+                "filter": {"OWNER_TYPE_ID": 2, "OWNER_ID": deal_id, "TYPE_ID": 2},
+                "select": ["ID", "SUBJECT", "START_TIME", "END_TIME", "COMPLETED", "PROVIDER_ID"],
+            },
+        )
+
+    def get_call_transcript(self, activity_id: int) -> str | None:
+        result = self.call("crm.activity.call.getTranscript", {"activityId": activity_id})
+        if not result:
+            return None
+        transcript = str(result.get("transcription", "")).strip()
+        return transcript or None
+
     def resolve_deal_field(self, display_name: str) -> DealField:
         fields = self.call("crm.deal.userfield.list", {"order": {"ID": "ASC"}})
         target = display_name.casefold()
@@ -57,4 +74,3 @@ class BitrixClient:
                 }
                 return DealField(field["FIELD_NAME"], field.get("USER_TYPE_ID", "string"), enum)
         raise RuntimeError(f"Не найдено поле сделки: {display_name}")
-

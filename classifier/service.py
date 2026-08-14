@@ -15,6 +15,7 @@ class ProcessingResult:
     deal_id: int
     analysis: CallAnalysis
     updated_fields: dict[str, str]
+    activity_id: int | None = None
 
 
 class CallProcessingService:
@@ -42,6 +43,24 @@ class CallProcessingService:
             self.bitrix.update_deal(deal_id, fields)
             self.bitrix.add_timeline_comment(deal_id, f"{MARKER}\nКраткое резюме звонка:\n{analysis.summary}")
         return ProcessingResult(deal_id, analysis, fields)
+
+    def process_existing_deal(self, deal_id: int, dry_run: bool = False) -> ProcessingResult:
+        self.bitrix.get_deal(deal_id)
+        calls = self.bitrix.list_deal_calls(deal_id)
+        if not calls:
+            raise ValueError(f"У сделки {deal_id} нет звонков")
+        for activity in calls:
+            activity_id = int(activity["ID"])
+            transcript = self.bitrix.get_call_transcript(activity_id)
+            if transcript:
+                result = self.process(deal_id, transcript, dry_run=dry_run)
+                return ProcessingResult(
+                    result.deal_id,
+                    result.analysis,
+                    result.updated_fields,
+                    activity_id=activity_id,
+                )
+        raise ValueError(f"У звонков сделки {deal_id} нет готовой расшифровки")
 
 
 def extract_event(payload: dict, bitrix: BitrixClient) -> tuple[int, str]:

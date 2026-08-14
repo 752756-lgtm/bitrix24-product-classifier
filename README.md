@@ -16,6 +16,8 @@
 - JSON/form-urlencoded с `activity_id` — сервис сам читает активность через `crm.activity.get`, берет `DESCRIPTION` и находит привязанную сделку;
 - стандартные ключи события Битрикс24 `data[FIELDS][ID]`, `data[FIELDS][OWNER_ID]` и `data[FIELDS][DESCRIPTION]`.
 
+Для старой сделки доступен `POST /bitrix/backfill-deal/{deal_id}`. Сервис получает все связанные дела типа «Звонок», начиная с последнего, и использует первую доступную готовую расшифровку через `crm.activity.call.getTranscript`.
+
 Пример проверки без записи в CRM:
 
 ```bash
@@ -45,6 +47,18 @@ docker run -d --restart unless-stopped --env-file .env -p 8080:8080 bitrix24-cal
 
 ```bash
 curl http://localhost:8080/health
+```
+
+Проверка старой сделки без записи:
+
+```bash
+python -m classifier.backfill --deal-id 314319
+```
+
+Запись подтвержденного результата:
+
+```bash
+python -m classifier.backfill --deal-id 314319 --write
 ```
 
 ## Переменные окружения

@@ -52,3 +52,26 @@ async def call_transcript(request: Request, x_webhook_secret: str = Header(defau
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/bitrix/backfill-deal/{deal_id}")
+def backfill_deal(deal_id: int, x_webhook_secret: str = Header(default=""), dry_run: bool = True) -> dict:
+    if config.webhook_secret and not hmac.compare_digest(config.webhook_secret, x_webhook_secret):
+        raise HTTPException(status_code=401, detail="Неверный секрет вебхука")
+    try:
+        result = service.process_existing_deal(deal_id, dry_run=dry_run)
+        return {
+            "ok": True,
+            "deal_id": result.deal_id,
+            "activity_id": result.activity_id,
+            "title": result.analysis.title,
+            "summary": result.analysis.summary,
+            "category": result.analysis.category,
+            "subcategory": result.analysis.subcategory,
+            "updated_fields": result.updated_fields,
+            "dry_run": dry_run,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
