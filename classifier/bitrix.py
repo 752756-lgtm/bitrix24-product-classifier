@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import datetime
+import json
 from typing import Any
-
-import httpx
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from .domain import DealProduct
 
@@ -19,15 +21,24 @@ def _normalized(value: str) -> str:
 class BitrixClient:
     def __init__(self, webhook_url: str, timeout: float = 30.0) -> None:
         self.webhook_url = webhook_url.rstrip("/") + "/"
-        self.client = httpx.Client(timeout=timeout)
+        self.timeout = timeout
+        self._deal_fields: dict[str, Any] | None = None
 
     def close(self) -> None:
-        self.client.close()
+        pass
 
     def _call(self, method: str, payload: dict[str, Any]) -> Any:
-        response = self.client.post(self.webhook_url + method + ".json", json=payload)
-        response.raise_for_status()
-        data = response.json()
+        request = Request(
+            self.webhook_url + method + ".json",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "bitrix24-classifier/0.1"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise BitrixError(f"Bitrix request {method} failed: {exc}") from exc
         if "error" in data:
             raise BitrixError(f"{data['error']}: {data.get('error_description', '')}")
         return data.get("result")
@@ -48,8 +59,31 @@ class BitrixClient:
     def update_deal(self, deal_id: int, fields: dict[str, str]) -> None:
         self._call("crm.deal.update", {"id": deal_id, "fields": fields})
 
+    def list_deals_created(self, date_from: datetime, date_to: datetime) -> list[int]:
+        deal_ids: list[int] = []
+        start = 0
+        while True:
+            rows = self._call(
+                "crm.deal.list",
+                {
+                    "filter": {
+                        ">=DATE_CREATE": date_from.isoformat(),
+                        "<=DATE_CREATE": date_to.isoformat(),
+                    },
+                    "order": {"ID": "ASC"},
+                    "select": ["ID"],
+                    "start": start,
+                },
+            ) or []
+            deal_ids.extend(int(row["ID"]) for row in rows)
+            if len(rows) < 50:
+                return deal_ids
+            start += len(rows)
+
     def resolve_enumeration_value(self, field_title: str, value: str) -> tuple[str, str]:
-        fields = self._call("crm.deal.fields", {}) or {}
+        if self._deal_fields is None:
+            self._deal_fields = self._call("crm.deal.fields", {}) or {}
+        fields = self._deal_fields
         wanted_title = _normalized(field_title)
         for field_id, field in fields.items():
             labels = [
