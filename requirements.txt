@@ -1,1 +1,1 @@
-httpx>=0.27,<1
+# Runtime dependencies are intentionally limited to the Python standard library.
