@@ -46,6 +46,9 @@ class BitrixClient:
 
     def get_deal_products(self, deal_id: int) -> list[DealProduct]:
         rows = self._call("crm.deal.productrows.get", {"id": deal_id}) or []
+        return self._products_from_rows(rows)
+
+    def _products_from_rows(self, rows: list[dict[str, Any]]) -> list[DealProduct]:
         products: list[DealProduct] = []
         for row in rows:
             name = str(row.get("PRODUCT_NAME", ""))
