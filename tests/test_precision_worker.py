@@ -685,6 +685,42 @@ class PrecisionWorkerTests(unittest.TestCase):
             finally:
                 state.close()
 
+    def test_run_exit_when_complete_returns_without_hour_sleep(self):
+        events = []
+
+        class BoundedWorker(PrecisionWorker):
+            def initialize(self):
+                events.append("initialize")
+
+            def process_one_batch(self):
+                events.append("process")
+                return False
+
+            def write_status(self, error=""):
+                events.append(("status", error))
+
+            def sleep(self, seconds):
+                raise AssertionError(f"bounded worker must not sleep for {seconds} seconds")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, status="verified")
+                base = make_worker(state, FakeBitrix(), directory)
+                worker = BoundedWorker(
+                    state, base.bitrix, base.approved_plan, base.expected_categories,
+                    base.expected_subcategories, base.allowed_pairs, base.identity,
+                    2025, 20, 60, Path(directory) / "status.json",
+                )
+
+                worker.run(exit_when_complete=True)
+
+                self.assertEqual(events[:2], ["initialize", "process"])
+                self.assertEqual(state.counts(), {"verified": 1})
+                self.assertEqual(events.count(("status", "")), 2)
+            finally:
+                state.close()
+
     def test_timeout_after_successful_write_is_verified_not_retried(self):
         class TimeoutWorker(PrecisionWorker):
             fetch_count = 0

@@ -66,7 +66,7 @@ class CoreTests(unittest.TestCase):
             [ProductGroup("Грузоподъемное оборудование", "Электрические тали")],
             "Категория товаров (Сайт)", "Подкатегория товаров (Сайт)",
         )
-        result = service.process_existing_deal(314319, dry_run=True)
+        result = service.process_existing_deal(123456, dry_run=True)
         self.assertEqual(result.activity_id, 10)
         self.assertIn("электротельфер", result.analysis.title)
 
