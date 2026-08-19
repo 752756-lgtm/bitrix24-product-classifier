@@ -301,10 +301,10 @@ jobs:
       PRECISION_WRITE_INTERVAL_SECONDS: "60"
       PRECISION_API_INTERVAL_SECONDS: "1.2"
       PRECISION_HTTP_TIMEOUT: "90"
-      PRECISION_STATE_PATH: ${{ runner.temp }}/precision.sqlite3
-      PRECISION_STATUS_PATH: ${{ runner.temp }}/precision-status.json
-      PRECISION_PLAN_KEY_PATH: ${{ runner.temp }}/precision-plan.key
-      PRECISION_LOCK_PATH: ${{ runner.temp }}/precision.lock
+      PRECISION_STATE_PATH: /tmp/precision-${{ github.run_id }}-${{ github.run_attempt }}.sqlite3
+      PRECISION_STATUS_PATH: /tmp/precision-${{ github.run_id }}-${{ github.run_attempt }}-status.json
+      PRECISION_PLAN_KEY_PATH: /tmp/precision-${{ github.run_id }}-${{ github.run_attempt }}-plan.key
+      PRECISION_LOCK_PATH: /tmp/precision-${{ github.run_id }}-${{ github.run_attempt }}.lock
       LOG_LEVEL: "WARNING"
 
     steps:
