@@ -1,0 +1,817 @@
+import json
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from classifier.precision_plan import (
+    PLAN_FORMAT,
+    PLAN_VERSION,
+    ApprovedPlan,
+    canonical_product_evidence,
+    derive_plan_key,
+    desired_fingerprint,
+    entries_digest,
+    key_check,
+    manifest_mac,
+    portal_identity,
+    transition_fingerprint,
+)
+from classifier.precision_worker import (
+    CATEGORY_FIELD,
+    SUBCATEGORY_FIELD,
+    EXCLUDED_STAGE_NAMES,
+    MAX_UNCONFIRMED_ATTEMPTS,
+    PermanentWorkerError,
+    PrecisionWorker,
+    State,
+    cached_plan_key,
+    chunks,
+    is_transient_error,
+    normalized,
+    normalize_stage_name,
+    persist_plan_key,
+    retry_delay,
+    single_instance,
+)
+
+
+TEST_WEBHOOK = "https://example.bitrix24.test/rest/1/test-token/"
+TEST_PORTAL = portal_identity(TEST_WEBHOOK)
+TEST_KEY = derive_plan_key(TEST_WEBHOOK, TEST_PORTAL)
+
+
+def approved_plan(rows):
+    transitions = set()
+    desired_modes = {}
+    for row in rows:
+        deal_id, original, desired = row[:3]
+        evidence_mode = row[3] if len(row) > 3 else "fields"
+        evidence = row[4] if len(row) > 4 else ""
+        transitions.add(
+            transition_fingerprint(
+                TEST_KEY,
+                deal_id,
+                original[0],
+                original[1],
+                desired[0],
+                desired[1],
+                evidence_mode,
+                evidence,
+            )
+        )
+        desired_modes[
+            desired_fingerprint(TEST_KEY, deal_id, desired[0], desired[1])
+        ] = evidence_mode
+    return ApprovedPlan(
+        2025, len(rows), frozenset(transitions), desired_modes, "digest", TEST_KEY
+    )
+
+
+def signed_allowlist(deal_id=42, portal=TEST_PORTAL):
+    transition = transition_fingerprint(
+        TEST_KEY, deal_id, "old", "broad", "1821", "2071"
+    )
+    desired = desired_fingerprint(TEST_KEY, deal_id, "1821", "2071")
+    content_lines = [f"{transition}\t{desired}\tfields"]
+    header = {
+        "format": PLAN_FORMAT,
+        "version": PLAN_VERSION,
+        "year": 2025,
+        "count": 1,
+        "portal": portal,
+        "key_check": key_check(TEST_KEY),
+        "entries_digest": entries_digest(content_lines),
+    }
+    header["manifest_mac"] = manifest_mac(TEST_KEY, header)
+    return header, content_lines
+
+
+class FakeBitrix:
+    def __init__(self, live_deals=None, responses=None):
+        self.live_deals = live_deals or {}
+        self.responses = responses or {}
+        self.calls = []
+
+    def call(self, method, params=None):
+        self.calls.append((method, params))
+        if method == "crm.deal.list":
+            deal_ids = {int(value) for value in params["filter"]["@ID"]}
+            rows = []
+            for deal_id in sorted(deal_ids):
+                live = self.live_deals.get(deal_id)
+                if live is None:
+                    continue
+                rows.append(
+                    {
+                        "ID": str(deal_id),
+                        CATEGORY_FIELD: live[0],
+                        SUBCATEGORY_FIELD: live[1],
+                        "STAGE_ID": live[2],
+                        "TITLE": live[3] if len(live) > 3 else "",
+                    }
+                )
+            return rows
+        key = (method, (params or {}).get("filter", {}).get("ENTITY_ID"))
+        if key in self.responses:
+            return self.responses[key]
+        if method in self.responses:
+            return self.responses[method]
+        raise AssertionError(f"Unexpected Bitrix method: {method}")
+
+
+def make_worker(state, bitrix, directory, plan=None, pairs=(("cat-new", "sub-new"),)):
+    plan = plan or approved_plan([(1, ("cat-old", "sub-old"), ("cat-new", "sub-new"))])
+    return PrecisionWorker(
+        state=state,
+        bitrix=bitrix,
+        approved_plan=plan,
+        expected_categories={pair[0]: pair[0] for pair in pairs},
+        expected_subcategories={pair[1]: pair[1] for pair in pairs},
+        allowed_pairs=tuple(pairs),
+        identity={"test": True},
+        year=2025,
+        batch_size=20,
+        write_interval=60,
+        status_path=Path(directory) / "status.json",
+    )
+
+
+def enqueue(
+    state,
+    deal_id,
+    original=("cat-old", "sub-old"),
+    desired=("cat-new", "sub-new"),
+    status="pending",
+    evidence_mode="fields",
+):
+    state.enqueue(
+        deal_id, original, desired, "NEW", status, evidence_mode, "unit_test"
+    )
+    state.commit()
+    return state.db.execute("SELECT * FROM queue WHERE deal_id=?", (deal_id,)).fetchone()
+
+
+class PrecisionWorkerTests(unittest.TestCase):
+    def test_persisted_plan_key_roundtrip_and_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "precision-plan.key"
+            persist_plan_key(path, TEST_KEY)
+            self.assertEqual(cached_plan_key(path), TEST_KEY)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_cached_plan_key_rejects_invalid_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "precision-plan.key"
+            for value in ("not-hex\n", "00\n"):
+                with self.subTest(value=value.strip()):
+                    path.write_text(value)
+                    with self.assertRaises(PermanentWorkerError):
+                        cached_plan_key(path)
+
+    def test_helpers_and_retry_cap(self):
+        self.assertEqual(normalize_stage_name("  Реклама / СПАМ  "), "реклама спам")
+        self.assertEqual(normalize_stage_name("Документы — Акты"), "документы акты")
+        self.assertEqual(normalized(False), "")
+        self.assertEqual(normalized(0), "0")
+        self.assertEqual(list(chunks(range(5), 2)), [[0, 1], [2, 3], [4]])
+        self.assertTrue(is_transient_error(RuntimeError("OVERLOAD_LIMIT")))
+        self.assertFalse(is_transient_error(ValueError("invalid field")))
+        with patch("classifier.precision_worker.random.uniform", return_value=1.2):
+            self.assertEqual(retry_delay(999, quota=True), 900.0)
+
+    def test_product_evidence_canonicalizes_numeric_values_and_row_order(self):
+        first = [
+            {
+                "productId": 2,
+                "productName": "Таль",
+                "price": "100.000",
+                "quantity": "2.00",
+            },
+            {
+                "PRODUCT_ID": "1",
+                "PRODUCT_NAME": "Тележка",
+                "PRICE": "12.5000",
+                "QUANTITY": 1,
+            },
+        ]
+        reordered = [
+            {
+                "product_id": "1",
+                "name": "Тележка",
+                "price": 12.5,
+                "quantity": "1.000",
+            },
+            {
+                "product_id": "2",
+                "name": "Таль",
+                "price": 100,
+                "quantity": 2,
+            },
+        ]
+        expected = '[["1","Тележка","12.5","1"],["2","Таль","100","2"]]'
+        self.assertEqual(canonical_product_evidence(first), expected)
+        self.assertEqual(canonical_product_evidence(reordered), expected)
+
+    def test_plan_recovers_only_approved_target_and_transition(self):
+        plan = approved_plan([(42, ("old", "broad"), ("1821", "2071"))])
+        pairs = (("1821", "2071"), ("1823", "2285"))
+        self.assertEqual(plan.target_for(42, pairs), ("1821", "2071", "fields"))
+        self.assertIsNone(plan.target_for(43, pairs))
+        self.assertTrue(plan.approves_transition(42, ("old", "broad"), ("1821", "2071")))
+        self.assertFalse(plan.approves_transition(42, ("manual", "change"), ("1821", "2071")))
+
+    def test_allowlist_loader_rejects_wrong_key_portal_and_tampered_manifest(self):
+        header, content_lines = signed_allowlist()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.allowlist"
+            path.write_text(
+                json.dumps(header) + "\n" + "\n".join(content_lines) + "\n"
+            )
+            loaded = ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
+            self.assertEqual(loaded.count, 1)
+            with self.assertRaisesRegex(ValueError, "Ключ"):
+                ApprovedPlan.load(
+                    path, derive_plan_key("wrong", TEST_PORTAL), 2025, TEST_PORTAL
+                )
+            with self.assertRaisesRegex(ValueError, "другого портала"):
+                ApprovedPlan.load(
+                    path,
+                    TEST_KEY,
+                    2025,
+                    portal_identity("https://other.bitrix24.test/rest/1/token/"),
+                )
+
+            tampered = dict(header)
+            tampered["count"] = 2
+            path.write_text(
+                json.dumps(tampered) + "\n" + "\n".join(content_lines) + "\n"
+            )
+            with self.assertRaisesRegex(ValueError, "Подпись заголовка"):
+                ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
+
+    def test_state_persists_and_rejects_other_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker.sqlite3"
+            state = State(path)
+            state.bind_identity({"portal": "one", "year": 2025})
+            enqueue(state, 1, status="retry_wait")
+            state.close()
+            reopened = State(path)
+            try:
+                self.assertEqual(reopened.counts(), {"retry_wait": 1})
+                with self.assertRaises(PermanentWorkerError):
+                    reopened.bind_identity({"portal": "two", "year": 2025})
+            finally:
+                reopened.close()
+
+    def test_waiting_instance_acquires_lock_after_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "worker.lock"
+            marker = Path(directory) / "acquired"
+            script = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "from classifier.precision_worker import single_instance\n"
+                "with single_instance(Path(sys.argv[1]), wait_for_lock=True):\n"
+                "    Path(sys.argv[2]).write_text('ok')\n"
+            )
+            with single_instance(lock_path):
+                process = subprocess.Popen(
+                    [sys.executable, "-c", script, str(lock_path), str(marker)]
+                )
+                time.sleep(0.15)
+                self.assertIsNone(process.poll())
+                self.assertFalse(marker.exists())
+            process.wait(timeout=3)
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(marker.read_text(), "ok")
+
+    def test_live_guard_covers_all_safe_states(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                item = enqueue(state, 1)
+                worker = make_worker(state, FakeBitrix(), directory)
+                worker.excluded_stage_ids = {"EXCLUDED"}
+                self.assertEqual(
+                    worker.classify_live(item, ("cat-new", "sub-new", "NEW", "")),
+                    "verified",
+                )
+                self.assertEqual(
+                    worker.classify_live(item, ("cat-old", "sub-old", "NEW", "")),
+                    "write",
+                )
+                self.assertEqual(
+                    worker.classify_live(item, ("manual", "manual", "NEW", "")),
+                    "conflict",
+                )
+                self.assertEqual(
+                    worker.classify_live(
+                        item, ("cat-old", "sub-old", "EXCLUDED", "")
+                    ),
+                    "excluded_stage",
+                )
+                self.assertEqual(worker.classify_live(item, None), "missing")
+            finally:
+                state.close()
+
+    def test_title_evidence_change_becomes_conflict(self):
+        original_title = "Тельфер электрический канатный 2 т"
+        plan = approved_plan(
+            [
+                (
+                    1,
+                    ("cat-old", "sub-old"),
+                    ("cat-new", "sub-new"),
+                    "title",
+                    original_title,
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                item = enqueue(state, 1, evidence_mode="title")
+                worker = make_worker(state, FakeBitrix(), directory, plan=plan)
+                self.assertEqual(
+                    worker.classify_live(
+                        item, ("cat-old", "sub-old", "NEW", original_title)
+                    ),
+                    "write",
+                )
+                self.assertEqual(
+                    worker.classify_live(
+                        item,
+                        ("cat-old", "sub-old", "NEW", "Станок для гибки арматуры"),
+                    ),
+                    "conflict",
+                )
+            finally:
+                state.close()
+
+    def test_changed_product_row_becomes_conflict(self):
+        approved_rows = [
+            {
+                "productId": "10",
+                "productName": "Тельфер электрический канатный",
+                "price": "100000.00",
+                "quantity": "1.0",
+            }
+        ]
+        approved_evidence = canonical_product_evidence(approved_rows)
+        plan = approved_plan(
+            [
+                (
+                    1,
+                    ("cat-old", "sub-old"),
+                    ("cat-new", "sub-new"),
+                    "products",
+                    approved_evidence,
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                item = enqueue(state, 1, evidence_mode="products")
+                worker = make_worker(state, FakeBitrix(), directory, plan=plan)
+                live = ("cat-old", "sub-old", "NEW", "Название не участвует")
+                self.assertEqual(
+                    worker.classify_live(item, live, approved_evidence), "write"
+                )
+                changed = canonical_product_evidence(
+                    [{**approved_rows[0], "quantity": "2"}]
+                )
+                self.assertEqual(worker.classify_live(item, live, changed), "conflict")
+                self.assertEqual(worker.classify_live(item, live, None), "conflict")
+            finally:
+                state.close()
+
+    def test_recover_inflight_verifies_requeues_or_stops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                for deal_id in range(1, 6):
+                    enqueue(state, deal_id, status="inflight")
+                fake = FakeBitrix(
+                    {
+                        1: ("cat-new", "sub-new", "NEW"),
+                        2: ("cat-old", "sub-old", "NEW"),
+                        3: ("manual", "manual", "NEW"),
+                        4: ("cat-old", "sub-old", "EXCLUDED"),
+                    }
+                )
+                worker = make_worker(state, fake, directory)
+                worker.approved_plan = approved_plan(
+                    [
+                        (deal_id, ("cat-old", "sub-old"), ("cat-new", "sub-new"))
+                        for deal_id in range(1, 6)
+                    ]
+                )
+                worker.excluded_stage_ids = {"EXCLUDED"}
+                worker.recover_inflight()
+                statuses = {
+                    int(row["deal_id"]): row["status"]
+                    for row in state.db.execute("SELECT deal_id,status FROM queue ORDER BY deal_id")
+                }
+                self.assertEqual(
+                    statuses,
+                    {1: "verified", 2: "pending", 3: "conflict", 4: "excluded_stage", 5: "missing"},
+                )
+            finally:
+                state.close()
+
+    def test_fetch_product_evidence_groups_rows_and_paginates(self):
+        first_page = [
+            {
+                "ownerId": 1 if index % 2 == 0 else 2,
+                "productId": index + 1,
+                "productName": f"Товар {index + 1}",
+                "price": f"{index + 1}.00",
+                "quantity": "1.0",
+            }
+            for index in range(50)
+        ]
+        second_page = [
+            {
+                "ownerId": 1,
+                "productId": 51,
+                "productName": "Товар 51",
+                "price": "51.0",
+                "quantity": "2.00",
+            },
+            {
+                "ownerId": 3,
+                "productId": 52,
+                "productName": "Товар 52",
+                "price": "52",
+                "quantity": 3,
+            },
+        ]
+
+        class ProductRowsBitrix:
+            def __init__(self):
+                self.starts = []
+
+            def call(self, method, params=None):
+                self.assert_method(method)
+                start = params.get("start", 0)
+                self.starts.append(start)
+                return {
+                    "productRows": first_page if start == 0 else second_page
+                }
+
+            @staticmethod
+            def assert_method(method):
+                if method != "crm.item.productrow.list":
+                    raise AssertionError(f"Unexpected Bitrix method: {method}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                fake = ProductRowsBitrix()
+                worker = make_worker(state, fake, directory)
+                result = worker.fetch_product_evidence([1, 2, 3])
+                expected_rows = first_page + second_page
+                for deal_id in (1, 2, 3):
+                    self.assertEqual(
+                        result[deal_id],
+                        canonical_product_evidence(
+                            [
+                                row
+                                for row in expected_rows
+                                if row["ownerId"] == deal_id
+                            ]
+                        ),
+                    )
+                self.assertEqual(fake.starts, [0, 50])
+            finally:
+                state.close()
+
+    def test_excluded_stages_are_collected_from_all_funnels(self):
+        default_rows = [
+            {"NAME": "Дубль", "STATUS_ID": "DUPLICATE"},
+            {"NAME": "Поставщик", "STATUS_ID": "SUPPLIER"},
+        ]
+        extra_rows = [
+            {"NAME": "Дубль", "STATUS_ID": "DUPLICATE"},
+            {"NAME": "Реклама / Спам", "STATUS_ID": "SPAM"},
+            {"NAME": "Документы / Акты", "STATUS_ID": "DOCS"},
+            {"NAME": "Доставка", "STATUS_ID": "DELIVERY"},
+        ]
+        fake = FakeBitrix(
+            responses={
+                "crm.category.list": {"categories": [{"id": 7}]},
+                ("crm.status.list", "DEAL_STAGE"): default_rows,
+                ("crm.status.list", "DEAL_STAGE_7"): extra_rows,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                worker = make_worker(state, fake, directory)
+                values = worker._resolve_excluded_stages()
+                self.assertEqual(
+                    values,
+                    {"DUPLICATE", "SUPPLIER", "C7:DUPLICATE", "C7:SPAM", "C7:DOCS", "C7:DELIVERY"},
+                )
+                self.assertEqual(EXCLUDED_STAGE_NAMES, {"дубль", "реклама спам", "поставщик", "документы акты", "доставка"})
+            finally:
+                state.close()
+
+    def test_category_list_pagination_discovers_extra_funnel(self):
+        class PaginatedCategoryBitrix:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+                if method == "crm.category.list":
+                    start = params.get("start", 0)
+                    if start == 0:
+                        return {"categories": [{"id": value} for value in range(1, 51)]}
+                    if start == 50:
+                        return {"categories": [{"id": 77}]}
+                    return {"categories": []}
+                if method == "crm.status.list":
+                    if params["filter"]["ENTITY_ID"] == "DEAL_STAGE":
+                        return [
+                            {"NAME": "Дубль", "STATUS_ID": "DUPLICATE"},
+                            {"NAME": "Реклама / Спам", "STATUS_ID": "SPAM"},
+                            {"NAME": "Поставщик", "STATUS_ID": "SUPPLIER"},
+                            {"NAME": "Документы / Акты", "STATUS_ID": "DOCS"},
+                            {"NAME": "Доставка", "STATUS_ID": "DELIVERY"},
+                        ]
+                    return [{"NAME": "Новая", "STATUS_ID": "NEW"}]
+                raise AssertionError(f"Unexpected Bitrix method: {method}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                fake = PaginatedCategoryBitrix()
+                worker = make_worker(state, fake, directory)
+                worker._resolve_excluded_stages()
+                category_starts = [
+                    params["start"]
+                    for method, params in fake.calls
+                    if method == "crm.category.list"
+                ]
+                status_entities = {
+                    params["filter"]["ENTITY_ID"]
+                    for method, params in fake.calls
+                    if method == "crm.status.list"
+                }
+                self.assertEqual(category_starts, [0, 50])
+                self.assertIn("DEAL_STAGE_77", status_entities)
+            finally:
+                state.close()
+
+    def test_empty_extra_funnel_fails_closed(self):
+        fake = FakeBitrix(
+            responses={
+                "crm.category.list": {"categories": [{"id": 7}]},
+                ("crm.status.list", "DEAL_STAGE"): [
+                    {"NAME": "Дубль", "STATUS_ID": "DUPLICATE"},
+                    {"NAME": "Реклама / Спам", "STATUS_ID": "SPAM"},
+                    {"NAME": "Поставщик", "STATUS_ID": "SUPPLIER"},
+                    {"NAME": "Документы / Акты", "STATUS_ID": "DOCS"},
+                    {"NAME": "Доставка", "STATUS_ID": "DELIVERY"},
+                ],
+                ("crm.status.list", "DEAL_STAGE_7"): [],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                worker = make_worker(state, fake, directory)
+                with self.assertRaisesRegex(
+                    PermanentWorkerError, "DEAL_STAGE_7 не вернула ни одного этапа"
+                ):
+                    worker._resolve_excluded_stages()
+            finally:
+                state.close()
+
+    def test_missing_required_stage_fails_closed(self):
+        fake = FakeBitrix(
+            responses={
+                "crm.category.list": {"categories": []},
+                ("crm.status.list", "DEAL_STAGE"): [{"NAME": "Дубль", "STATUS_ID": "DUPLICATE"}],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                worker = make_worker(state, fake, directory)
+                with self.assertRaises(PermanentWorkerError):
+                    worker._resolve_excluded_stages()
+            finally:
+                state.close()
+
+    def test_batch_error_parser_keeps_per_command_error(self):
+        errors = PrecisionWorker._batch_errors(
+            {
+                "result_error": {
+                    "deal_17": {"error": "ERROR_CORE", "error_description": "bad field"},
+                    "unrelated": {"error": "ignored"},
+                }
+            }
+        )
+        self.assertEqual(set(errors), {17})
+        self.assertIn("bad field", str(errors[17]))
+
+    def test_product_evidence_is_fetched_before_final_live_guard(self):
+        events = []
+        product_evidence = canonical_product_evidence(
+            [
+                {
+                    "productId": "10",
+                    "productName": "Тельфер",
+                    "price": "100",
+                    "quantity": "1",
+                }
+            ]
+        )
+
+        class OrderedWorker(PrecisionWorker):
+            def wait_for_write_slot(self):
+                events.append("wait")
+
+            def fetch_product_evidence(self, deal_ids):
+                events.append("products")
+                return {1: product_evidence}
+
+            def fetch_live(self, deal_ids):
+                events.append("live")
+                if events.count("live") == 1:
+                    return {1: ("cat-old", "sub-old", "NEW", "")}
+                return {1: ("cat-new", "sub-new", "NEW", "")}
+
+            def call(self, method, params=None):
+                events.append(method)
+                return {"result": {"deal_1": True}, "result_error": {}}
+
+            def sleep(self, seconds):
+                events.append("verify_wait")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, evidence_mode="products")
+                plan = approved_plan(
+                    [
+                        (
+                            1,
+                            ("cat-old", "sub-old"),
+                            ("cat-new", "sub-new"),
+                            "products",
+                            product_evidence,
+                        )
+                    ]
+                )
+                base = make_worker(state, FakeBitrix(), directory, plan=plan)
+                worker = OrderedWorker(
+                    state, base.bitrix, base.approved_plan, base.expected_categories,
+                    base.expected_subcategories, base.allowed_pairs, base.identity,
+                    2025, 20, 60, Path(directory) / "status.json",
+                )
+                worker.metadata_resolved_at = time.time()
+                worker.process_one_batch()
+                self.assertEqual(events[:4], ["wait", "products", "live", "batch"])
+                self.assertEqual(state.counts(), {"verified": 1})
+            finally:
+                state.close()
+
+    def test_timeout_after_successful_write_is_verified_not_retried(self):
+        class TimeoutWorker(PrecisionWorker):
+            fetch_count = 0
+
+            def wait_for_write_slot(self):
+                pass
+
+            def fetch_live(self, deal_ids):
+                self.fetch_count += 1
+                value = (
+                    ("cat-old", "sub-old", "NEW", "")
+                    if self.fetch_count == 1
+                    else ("cat-new", "sub-new", "NEW", "")
+                )
+                return {1: value}
+
+            def call(self, method, params=None):
+                raise TimeoutError("timed out after server accepted request")
+
+            def sleep(self, seconds):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1)
+                base = make_worker(state, FakeBitrix(), directory)
+                worker = TimeoutWorker(
+                    state, base.bitrix, base.approved_plan, base.expected_categories,
+                    base.expected_subcategories, base.allowed_pairs, base.identity,
+                    2025, 20, 60, Path(directory) / "status.json",
+                )
+                worker.metadata_resolved_at = time.time()
+                worker.process_one_batch()
+                self.assertEqual(state.counts(), {"verified": 1})
+            finally:
+                state.close()
+
+    def test_partial_batch_errors_split_permanent_and_retry(self):
+        class PartialWorker(PrecisionWorker):
+            def wait_for_write_slot(self):
+                pass
+
+            def fetch_live(self, deal_ids):
+                return {
+                    deal_id: ("cat-old", "sub-old", "NEW", "")
+                    for deal_id in deal_ids
+                }
+
+            def call(self, method, params=None):
+                return {
+                    "result_error": {
+                        "deal_1": {"error": "ERROR_ARGUMENT", "error_description": "bad field"},
+                        "deal_2": {"error": "QUERY_LIMIT_EXCEEDED", "error_description": "wait"},
+                    }
+                }
+
+            def sleep(self, seconds):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1)
+                enqueue(state, 2)
+                plan = approved_plan(
+                    [
+                        (deal_id, ("cat-old", "sub-old"), ("cat-new", "sub-new"))
+                        for deal_id in (1, 2)
+                    ]
+                )
+                base = make_worker(state, FakeBitrix(), directory, plan=plan)
+                worker = PartialWorker(
+                    state, base.bitrix, base.approved_plan, base.expected_categories,
+                    base.expected_subcategories, base.allowed_pairs, base.identity,
+                    2025, 20, 60, Path(directory) / "status.json",
+                )
+                worker.metadata_resolved_at = time.time()
+                worker.process_one_batch()
+                self.assertEqual(state.counts(), {"permanent_error": 1, "retry_wait": 1})
+            finally:
+                state.close()
+
+    def test_unconfirmed_write_stops_after_retry_limit(self):
+        class UnconfirmedWorker(PrecisionWorker):
+            def wait_for_write_slot(self):
+                pass
+
+            def fetch_live(self, deal_ids):
+                return {
+                    deal_id: ("cat-old", "sub-old", "NEW", "")
+                    for deal_id in deal_ids
+                }
+
+            def call(self, method, params=None):
+                return {"result": {"deal_1": True}, "result_error": {}}
+
+            def sleep(self, seconds):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1)
+                state.db.execute(
+                    "UPDATE queue SET attempts=? WHERE deal_id=1",
+                    (MAX_UNCONFIRMED_ATTEMPTS - 1,),
+                )
+                state.commit()
+                base = make_worker(state, FakeBitrix(), directory)
+                worker = UnconfirmedWorker(
+                    state, base.bitrix, base.approved_plan, base.expected_categories,
+                    base.expected_subcategories, base.allowed_pairs, base.identity,
+                    2025, 20, 60, Path(directory) / "status.json",
+                )
+                worker.metadata_resolved_at = time.time()
+
+                worker.process_one_batch()
+
+                row = state.db.execute(
+                    "SELECT status,attempts FROM queue WHERE deal_id=1"
+                ).fetchone()
+                self.assertEqual(row["status"], "permanent_error")
+                self.assertEqual(row["attempts"], MAX_UNCONFIRMED_ATTEMPTS)
+            finally:
+                state.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
