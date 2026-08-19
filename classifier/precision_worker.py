@@ -867,7 +867,7 @@ class PrecisionWorker:
                     delay = 3600.0
                 self.sleep(delay)
 
-    def run(self) -> None:
+    def run(self, exit_when_complete: bool = False) -> None:
         try:
             self.initialize()
             while not self.stop:
@@ -879,6 +879,8 @@ class PrecisionWorker:
                     if not any(counts.get(status, 0) for status in ("pending", "retry_wait", "inflight")):
                         LOG.info("Обработка завершена: %s", counts)
                         self.write_status()
+                        if exit_when_complete:
+                            return
                         self.sleep(3600)
                     else:
                         next_row = self.state.db.execute(
@@ -954,6 +956,11 @@ def main() -> None:
     mode.add_argument("--check-config", action="store_true")
     mode.add_argument("--scan-only", action="store_true")
     parser.add_argument("--wait-for-lock", action="store_true")
+    parser.add_argument(
+        "--exit-when-complete",
+        action="store_true",
+        help="Завершить процесс после обработки всех активных строк очереди",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1038,7 +1045,7 @@ def main() -> None:
                 worker.write_status()
                 LOG.info("Согласованный план просканирован; CRM не изменялась")
             else:
-                worker.run()
+                worker.run(exit_when_complete=args.exit_when_complete)
         finally:
             state.close()
 

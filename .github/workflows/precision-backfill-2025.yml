@@ -1,0 +1,533 @@
+name: Backfill Bitrix24 categories for 2025
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/precision-backfill-2025.yml"
+      - "classifier/precision_worker.py"
+      - "classifier/precision_plan.py"
+      - "classifier/bitrix.py"
+      - "classifier/http.py"
+      - "classifier/data/precision-2025.allowlist"
+      - "classifier/data/precision-2025-taxonomy.json"
+  workflow_dispatch:
+    inputs:
+      slice:
+        description: "Номер автоматического продолжения"
+        required: false
+        type: number
+        default: 0
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+# Every hosted entry point uses one group. Scheduled recovery waits instead of
+# interrupting an active slice; a new plan or an explicit restart supersedes it.
+concurrency:
+  group: bitrix24-category-backfill-2025-hosted
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+jobs:
+  safety_gate:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    outputs:
+      complete: ${{ steps.marker.outputs.complete }}
+      marker: ${{ steps.marker.outputs.name }}
+      safe_to_run: ${{ steps.stale.outputs.safe_to_run }}
+      retire_required: ${{ steps.stale.outputs.retire_required }}
+    steps:
+      - name: Require the default main branch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::CRM backfill can run only from refs/heads/main"
+            exit 1
+          fi
+
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve completion marker
+        id: marker
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          fingerprint="$({
+            sha256sum classifier/precision_worker.py
+            sha256sum classifier/precision_plan.py
+            sha256sum classifier/bitrix.py
+            sha256sum classifier/http.py
+            sha256sum classifier/data/precision-2025.allowlist
+            sha256sum classifier/data/precision-2025-taxonomy.json
+          } | sha256sum | cut -d' ' -f1)"
+          marker="precision-2025-complete-${fingerprint}"
+          printf 'name=%s\n' "${marker}" >> "${GITHUB_OUTPUT}"
+          if git ls-remote --exit-code --refs --tags origin "refs/tags/${marker}" >/dev/null; then
+            printf 'complete=true\n' >> "${GITHUB_OUTPUT}"
+            echo "This exact worker and plan already reached a terminal state"
+          else
+            printf 'complete=false\n' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Prove the stale production run cannot own the worker
+        id: stale
+        if: steps.marker.outputs.complete != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE_RUN_ID: "32265535057"
+          SAFETY_TAG: "precision-2025-stale-run-32265535057-safe"
+          SERVER_TAG: "precision-2025-stale-run-32265535057-server"
+          RETIRING_TAG: "precision-2025-stale-run-32265535057-retiring"
+          RETIRED_TAG: "precision-2025-stale-run-32265535057-retired"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          printf 'safe_to_run=false\n' >> "${GITHUB_OUTPUT}"
+          printf 'retire_required=false\n' >> "${GITHUB_OUTPUT}"
+
+          run_code() {
+            curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}"
+          }
+
+          assert_identity() {
+            identity="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" \
+              --jq '[.path,.head_branch,.head_sha] | @tsv')"
+            expected_identity="$(printf '%s\t%s\t%s' \
+              '.github/workflows/deploy.yml' 'main' '7e789e23ec3ae40e21899eb1b7ce7aa329625633')"
+            if [ "${identity}" != "${expected_identity}" ]; then
+              echo "::error::Stale run identity does not match the reviewed deployment"
+              exit 1
+            fi
+          }
+
+          prove_no_production_step() {
+            attempt="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.run_attempt')"
+            unsafe_jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}/jobs?filter=all" \
+              --jq '[.jobs[] | select(((.runner_id // 0) != 0) or (((.steps // []) | length) != 0))] | length')"
+            if [ "${attempt}" != "1" ] || [ "${unsafe_jobs}" != "0" ]; then
+              echo "::error::A production runner or step owned the stale run"
+              exit 1
+            fi
+          }
+
+          delete_stale_run() {
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" >/dev/null
+            deleted=0
+            for _ in $(seq 1 30); do
+              code="$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H 'Accept: application/vnd.github+json' \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}")"
+              if [ "${code}" = "404" ]; then
+                deleted=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "${deleted}" -ne 1 ]; then
+              echo "::error::The cancelled run remains replayable"
+              exit 1
+            fi
+          }
+
+          ensure_tag() {
+            tag="$1"
+            if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${tag}" -f "sha=${GITHUB_SHA}" >/dev/null 2>&1; then
+              gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null
+            fi
+          }
+
+          mark_safe() {
+            printf 'safe_to_run=true\n' >> "${GITHUB_OUTPUT}"
+          }
+
+          # The durable tag is written before DELETE. A later run can therefore
+          # finish either half of the two-phase tombstone after interruption.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RETIRED_TAG}" >/dev/null 2>&1; then
+            if [ "$(run_code)" != "404" ]; then
+              echo "::error::Retired writer tag exists but the stale run is replayable"
+              exit 1
+            fi
+            mark_safe
+            exit 0
+          fi
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${SAFETY_TAG}" >/dev/null 2>&1; then
+            code="$(run_code)"
+            if [ "${code}" = "404" ]; then
+              mark_safe
+              exit 0
+            fi
+            if [ "${code}" != "200" ]; then
+              echo "::error::Cannot inspect the tagged stale production run"
+              exit 1
+            fi
+            assert_identity
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.status')"
+            conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.conclusion // ""')"
+            if [ "${status}" != "completed" ] || [ "${conclusion}" != "cancelled" ]; then
+              echo "::error::Safety tag does not describe a safely cancelled run"
+              exit 1
+            fi
+            prove_no_production_step
+            delete_stale_run
+            mark_safe
+            exit 0
+          fi
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RETIRING_TAG}" >/dev/null 2>&1; then
+            if [ "$(run_code)" != "404" ]; then
+              echo "::error::Writer retirement started while the stale run is replayable"
+              exit 1
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${SERVER_TAG}" >/dev/null
+            printf 'retire_required=true\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${SERVER_TAG}" >/dev/null 2>&1; then
+            code="$(run_code)"
+            if [ "${code}" = "404" ]; then
+              printf 'retire_required=true\n' >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            if [ "${code}" != "200" ]; then
+              echo "::error::Cannot inspect the tagged production deployment"
+              exit 1
+            fi
+            assert_identity
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.status')"
+            conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.conclusion // ""')"
+            if [ "${status}" != "completed" ] || [ "${conclusion}" != "success" ]; then
+              echo "::error::Server tag does not describe a successful deployment"
+              exit 1
+            fi
+            delete_stale_run
+            printf 'retire_required=true\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          code="$(run_code)"
+          if [ "${code}" != "200" ]; then
+            echo "::error::Stale run disappeared without a durable ownership tag"
+            exit 1
+          fi
+
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.status')"
+          conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.conclusion // ""')"
+          assert_identity
+          if [ "${status}" = "completed" ] && [ "${conclusion}" = "success" ]; then
+            ensure_tag "${SERVER_TAG}"
+            delete_stale_run
+            printf 'retire_required=true\n' >> "${GITHUB_OUTPUT}"
+            echo "The successful production run is no longer replayable; its legacy writer must retire"
+            exit 0
+          fi
+          if [ "${status}" = "completed" ] && [ "${conclusion}" = "cancelled" ]; then
+            prove_no_production_step
+            ensure_tag "${SAFETY_TAG}"
+            delete_stale_run
+            mark_safe
+            echo "The production run was cancelled without starting a step"
+            exit 0
+          fi
+          if [ "${status}" != "queued" ]; then
+            echo "::error::Cannot prove that the stale production run never started"
+            exit 1
+          fi
+
+          started_jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}/jobs" \
+            --jq '[.jobs[] | select(.status != "queued")] | length')"
+          if [ "${started_jobs}" != "0" ]; then
+            echo "::error::The stale production run has a job that already started"
+            exit 1
+          fi
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.status')"
+          if [ "${status}" != "queued" ]; then
+            echo "::error::The stale production run changed state before cancellation"
+            exit 1
+          fi
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}/cancel" >/dev/null
+          cancelled=0
+          for _ in $(seq 1 30); do
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.status')"
+            conclusion="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${STALE_RUN_ID}" --jq '.conclusion // ""')"
+            if [ "${status}" = "completed" ] && [ "${conclusion}" = "cancelled" ]; then
+              cancelled=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "${cancelled}" -ne 1 ]; then
+            echo "::error::The stale production run was not safely cancelled"
+            exit 1
+          fi
+
+          prove_no_production_step
+          ensure_tag "${SAFETY_TAG}"
+          delete_stale_run
+          mark_safe
+          echo "The queued production run was cancelled and removed before any job started"
+
+  process:
+    needs: [safety_gate, mark_retired]
+    if: always() && needs.safety_gate.result == 'success' && needs.safety_gate.outputs.complete != 'true' && (needs.safety_gate.outputs.safe_to_run == 'true' || needs.mark_retired.outputs.retired == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    outputs:
+      exit_code: ${{ steps.processing.outputs.exit_code }}
+      terminal_complete: ${{ steps.processing.outputs.terminal_complete }}
+    env:
+      PRECISION_YEAR: "2025"
+      PRECISION_BATCH_SIZE: "20"
+      PRECISION_WRITE_INTERVAL_SECONDS: "60"
+      PRECISION_API_INTERVAL_SECONDS: "1.2"
+      PRECISION_HTTP_TIMEOUT: "90"
+      PRECISION_STATE_PATH: ${{ runner.temp }}/precision.sqlite3
+      PRECISION_STATUS_PATH: ${{ runner.temp }}/precision-status.json
+      PRECISION_PLAN_KEY_PATH: ${{ runner.temp }}/precision-plan.key
+      PRECISION_LOCK_PATH: ${{ runner.temp }}/precision.lock
+      LOG_LEVEL: "WARNING"
+
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate secret and worker configuration
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          PRECISION_PLAN_KEY: ${{ secrets.PRECISION_PLAN_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${BITRIX_WEBHOOK_URL}" ]; then
+            echo "::error::GitHub Secret BITRIX_WEBHOOK_URL is not configured"
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            if python -m classifier.precision_worker --check-config \
+              >"${RUNNER_TEMP}/precision-check.log" 2>&1; then
+              exit 0
+            fi
+            echo "Configuration check ${attempt} failed; retrying without exposing CRM logs"
+            sleep "$((attempt * 20))"
+          done
+          echo "::error::Worker configuration validation failed after three attempts"
+          exit 1
+
+      - name: Run a bounded processing slice
+        id: processing
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          PRECISION_PLAN_KEY: ${{ secrets.PRECISION_PLAN_KEY }}
+        shell: bash
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=120s 310m \
+            python -m classifier.precision_worker --exit-when-complete \
+            >"${RUNNER_TEMP}/precision-worker.log" 2>&1
+          rc=$?
+          set -e
+          printf 'exit_code=%s\n' "${rc}" >> "${GITHUB_OUTPUT}"
+          if [ ! -f "${PRECISION_STATUS_PATH}" ]; then
+            echo "::error::Worker did not write a status checkpoint"
+            exit 1
+          fi
+          PROCESS_EXIT_CODE="${rc}" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          status = json.loads(Path(os.environ["PRECISION_STATUS_PATH"]).read_text())
+          queue = status.get("queue", {})
+          summary = {
+              "plan_total": status.get("plan_total", 0),
+              "discovered": status.get("discovered", 0),
+              "undiscovered": status.get("undiscovered", 0),
+              "scan_complete": status.get("scan_complete", False),
+              "scan_incomplete": status.get("scan_incomplete", False),
+              "queue": queue,
+          }
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          complete = (
+              int(os.environ["PROCESS_EXIT_CODE"]) == 0
+              and status.get("scan_complete") is True
+              and status.get("scan_incomplete") is False
+              and int(status.get("undiscovered", 0)) == 0
+              and int(queue.get("permanent_error", 0)) == 0
+              and not any(int(queue.get(name, 0)) for name in ("pending", "retry_wait", "inflight"))
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"terminal_complete={'true' if complete else 'false'}\n")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+              output.write("## Bitrix24 backfill 2025\n\n")
+              for name, value in summary.items():
+                  if name != "queue":
+                      output.write(f"- {name}: {value}\n")
+              for name, value in sorted(queue.items()):
+                  output.write(f"- {name}: {value}\n")
+          PY
+          if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 124 ]; then
+            echo "::error::Worker stopped with exit code ${rc}; private log was not published"
+            exit "${rc}"
+          fi
+
+  begin_retire:
+    needs: safety_gate
+    if: needs.safety_gate.outputs.retire_required == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      begun: ${{ steps.marker.outputs.begun }}
+    steps:
+      - name: Record resumable writer retirement
+        id: marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RETIRING_TAG: "precision-2025-stale-run-32265535057-retiring"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${RETIRING_TAG}" -f "sha=${GITHUB_SHA}" >/dev/null 2>&1; then
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RETIRING_TAG}" >/dev/null
+          fi
+          printf 'begun=true\n' >> "${GITHUB_OUTPUT}"
+
+  retire_server_worker:
+    needs: [safety_gate, begin_retire]
+    if: needs.safety_gate.outputs.retire_required == 'true' && needs.begin_retire.outputs.begun == 'true'
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      retired: ${{ steps.retire.outputs.retired }}
+    steps:
+      - name: Retire the legacy writer with a verified Docker daemon
+        id: retire
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker info >/dev/null
+          for worker in \
+            bitrix24-category-backfill-2025 \
+            bitrix24-category-backfill-2025-next \
+            bitrix24-category-backfill-2025-previous; do
+            existing="$(docker ps -a --filter "name=^/${worker}$" --format '{{.Names}}')"
+            if [ -n "${existing}" ]; then
+              if [ "${existing}" != "${worker}" ]; then
+                echo "::error::Docker returned an ambiguous legacy writer name"
+                exit 1
+              fi
+              docker update --restart=no "${worker}" >/dev/null
+              running="$(docker inspect -f '{{.State.Running}}' "${worker}")"
+              if [ "${running}" = "true" ]; then
+                docker stop --time 120 "${worker}" >/dev/null
+              fi
+              docker rm "${worker}" >/dev/null
+            fi
+            remaining="$(docker ps -a --filter "name=^/${worker}$" --format '{{.Names}}')"
+            if [ -n "${remaining}" ]; then
+              echo "::error::Legacy category writer could not be retired"
+              exit 1
+            fi
+          done
+          # A stopped client cannot issue new writes. Keep an additional full
+          # HTTP-timeout window before granting the hosted writer ownership.
+          sleep 120
+          printf 'retired=true\n' >> "${GITHUB_OUTPUT}"
+          echo "Legacy writer containers were removed; persistent state was preserved"
+
+  mark_retired:
+    needs: retire_server_worker
+    if: needs.retire_server_worker.outputs.retired == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      retired: ${{ steps.marker.outputs.retired }}
+    steps:
+      - name: Record exclusive hosted ownership
+        id: marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RETIRED_TAG: "precision-2025-stale-run-32265535057-retired"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${RETIRED_TAG}" -f "sha=${GITHUB_SHA}" >/dev/null 2>&1; then
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RETIRED_TAG}" >/dev/null
+          fi
+          printf 'retired=true\n' >> "${GITHUB_OUTPUT}"
+
+  continue:
+    needs: process
+    if: needs.process.result == 'success' && needs.process.outputs.exit_code == '124'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch the next bounded slice
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_SLICE: ${{ inputs.slice || 0 }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${CURRENT_SLICE}" -ge 3 ]; then
+            echo "Automatic chain reached its safety cap; hourly recovery remains enabled"
+            exit 0
+          fi
+          next_slice="$((CURRENT_SLICE + 1))"
+          gh workflow run -R "${GITHUB_REPOSITORY}" precision-backfill-2025.yml \
+            --ref main -f "slice=${next_slice}"
+          echo "Processing slice ${next_slice} was dispatched"
+
+  complete:
+    needs: [safety_gate, process]
+    if: always() && needs.process.outputs.terminal_complete == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Record completion without exposing CRM credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MARKER: ${{ needs.safety_gate.outputs.marker }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${MARKER}" -f "sha=${GITHUB_SHA}" >/dev/null 2>&1; then
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${MARKER}" >/dev/null
+          fi
+          echo "All approved rows reached a complete, retry-free terminal state"

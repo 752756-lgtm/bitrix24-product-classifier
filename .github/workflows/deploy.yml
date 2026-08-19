@@ -1,14 +1,11 @@
 name: Deploy call summarizer
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       deal_id:
         description: "ID сделки для обязательной проверки без записи"
         required: true
-        default: "314319"
 
 permissions:
   contents: read
@@ -18,18 +15,70 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  hosted-backfill-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Require completed hosted backfill
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          fingerprint="$({
+            sha256sum classifier/precision_worker.py
+            sha256sum classifier/precision_plan.py
+            sha256sum classifier/bitrix.py
+            sha256sum classifier/http.py
+            sha256sum classifier/data/precision-2025.allowlist
+            sha256sum classifier/data/precision-2025-taxonomy.json
+          } | sha256sum | cut -d' ' -f1)"
+          marker="precision-2025-complete-${fingerprint}"
+          if ! git ls-remote --exit-code --refs --tags origin "refs/tags/${marker}" >/dev/null; then
+            echo "::error::Hosted 2025 backfill is still active; refusing to queue production deployment"
+            exit 1
+          fi
+
   test-and-deploy:
+    needs: hosted-backfill-gate
     runs-on: [self-hosted, linux, x64, production]
     timeout-minutes: 40
     env:
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-      DEAL_ID: ${{ inputs.deal_id || '314319' }}
+      DEAL_ID: ${{ inputs.deal_id }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Revalidate deployment ownership
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          latest_main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "${latest_main}" != "${GITHUB_SHA}" ]; then
+            echo "::error::A newer main commit exists; refusing to deploy a stale image"
+            exit 1
+          fi
+          fingerprint="$({
+            sha256sum classifier/precision_worker.py
+            sha256sum classifier/precision_plan.py
+            sha256sum classifier/bitrix.py
+            sha256sum classifier/http.py
+            sha256sum classifier/data/precision-2025.allowlist
+            sha256sum classifier/data/precision-2025-taxonomy.json
+          } | sha256sum | cut -d' ' -f1)"
+          marker="precision-2025-complete-${fingerprint}"
+          if ! git ls-remote --exit-code --refs --tags origin "refs/tags/${marker}" >/dev/null; then
+            echo "::error::Hosted 2025 backfill is still active; refusing to deploy"
+            exit 1
+          fi
 
       - name: Validate required secrets
         shell: bash
@@ -61,14 +110,6 @@ jobs:
             printf 'WEBHOOK_SECRET=%s\n' "${WEBHOOK_SECRET}"
             printf 'HTTP_TIMEOUT=%s\n' '45'
             printf 'TITLE_MAX_LENGTH=%s\n' '100'
-            printf 'PRECISION_YEAR=%s\n' '2025'
-            printf 'PRECISION_BATCH_SIZE=%s\n' '20'
-            printf 'PRECISION_WRITE_INTERVAL_SECONDS=%s\n' '60'
-            printf 'PRECISION_API_INTERVAL_SECONDS=%s\n' '1.2'
-            printf 'PRECISION_HTTP_TIMEOUT=%s\n' '90'
-            printf 'PRECISION_STATE_PATH=%s\n' '/data/precision.sqlite3'
-            printf 'PRECISION_STATUS_PATH=%s\n' '/data/precision-status.json'
-            printf 'PRECISION_PLAN_KEY_PATH=%s\n' '/data/precision-plan.key'
           } > "${RUNNER_TEMP}/runtime.env"
 
       - name: Build image
@@ -89,210 +130,193 @@ jobs:
             -v "${GITHUB_WORKSPACE}/tests:/app/tests:ro" \
             "${image}" python -m compileall -q classifier tests
 
-      - name: Dry-run deal and deploy services
+      - name: Dry-run deal and deploy web service
         shell: bash
         run: |
           set -Eeuo pipefail
           app_dir="${HOME}/.local/share/bitrix24-call-summarizer"
           container="bitrix24-call-summarizer"
-          worker_container="bitrix24-category-backfill-2025"
+          backup="${container}-previous"
           image="bitrix24-call-summarizer:${GITHUB_SHA}"
+          release_marker="${app_dir}/web-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.done"
+          transition_marker="${app_dir}/web-transition.active"
+          generation_file="${app_dir}/web-release-generation"
+          generation="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
 
           install -d -m 700 "${app_dir}"
-          install -d -m 700 "${app_dir}/precision-data"
           install -m 600 "${RUNNER_TEMP}/runtime.env" "${app_dir}/.env"
 
-          echo "Running mandatory dry-run for deal ${DEAL_ID}"
-          docker run --rm --env-file "${app_dir}/.env" "${image}" \
-            python -m classifier.backfill --deal-id "${DEAL_ID}"
-
-          echo "Validating worker metadata and persistent state without CRM writes"
-          worker_config_ok=0
-          for attempt in 1 2 3; do
-            if docker run --rm \
-              --env-file "${app_dir}/.env" \
-              -v "${app_dir}/precision-data:/data" \
-              "${image}" python -m classifier.precision_worker --check-config \
-              --lock /tmp/precision-check.lock --status /tmp/precision-check-status.json; then
-              worker_config_ok=1
-              break
-            fi
-            sleep "$((attempt * 20))"
-          done
-          if [ "${worker_config_ok}" -ne 1 ]; then
-            echo "Worker metadata validation failed after three attempts"
+          if ! docker run --rm --env-file "${app_dir}/.env" "${image}" \
+            python -m classifier.backfill --deal-id "${DEAL_ID}" \
+            >"${RUNNER_TEMP}/backfill-dry-run.log" 2>&1; then
+            echo "::error::Mandatory read-only dry-run failed; details remain private on the runner"
             false
           fi
+          echo "Mandatory read-only dry-run succeeded"
 
-          legacy_worker="${worker_container}-next"
-          worker_backup="${worker_container}-previous"
-          web_backup="${container}-previous"
-          current_worker="${worker_container}"
+          # The hosted workflow is the sole category writer. Remove only worker
+          # containers; persistent SQLite data remains under precision-data.
+          for worker in \
+            bitrix24-category-backfill-2025 \
+            bitrix24-category-backfill-2025-next \
+            bitrix24-category-backfill-2025-previous; do
+            docker update --restart=no "${worker}" >/dev/null 2>&1 || true
+            docker stop --time 30 "${worker}" >/dev/null 2>&1 || true
+            docker rm "${worker}" >/dev/null 2>&1 || true
+          done
 
-          canonical_web_running="$(docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null || true)"
-          web_backup_running="$(docker inspect -f '{{.State.Running}}' "${web_backup}" 2>/dev/null || true)"
-          if [ "${canonical_web_running}" != "true" ] && docker inspect "${web_backup}" >/dev/null 2>&1; then
-            if [ "${web_backup_running}" != "true" ]; then
-              docker start "${web_backup}" >/dev/null 2>&1 || true
-              sleep 2
-              web_backup_running="$(docker inspect -f '{{.State.Running}}' "${web_backup}" 2>/dev/null || true)"
-            fi
-            if [ "${web_backup_running}" = "true" ]; then
-              docker rm -f "${container}" >/dev/null 2>&1 || true
-              docker rename "${web_backup}" "${container}"
-              canonical_web_running=true
-            fi
-          fi
-
-          canonical_running="$(docker inspect -f '{{.State.Running}}' "${worker_container}" 2>/dev/null || true)"
-          legacy_running="$(docker inspect -f '{{.State.Running}}' "${legacy_worker}" 2>/dev/null || true)"
-          backup_running="$(docker inspect -f '{{.State.Running}}' "${worker_backup}" 2>/dev/null || true)"
-          if [ "${canonical_running}" != "true" ]; then
-            recovered_worker=""
-            if [ "${backup_running}" = "true" ]; then
-              recovered_worker="${worker_backup}"
-            elif [ "${legacy_running}" = "true" ]; then
-              recovered_worker="${legacy_worker}"
-            elif docker inspect "${worker_backup}" >/dev/null 2>&1; then
-              docker start "${worker_backup}" >/dev/null 2>&1 || true
-              sleep 2
-              backup_running="$(docker inspect -f '{{.State.Running}}' "${worker_backup}" 2>/dev/null || true)"
-              if [ "${backup_running}" = "true" ]; then
-                recovered_worker="${worker_backup}"
-              fi
-            elif docker inspect "${legacy_worker}" >/dev/null 2>&1; then
-              docker start "${legacy_worker}" >/dev/null 2>&1 || true
-              sleep 2
-              legacy_running="$(docker inspect -f '{{.State.Running}}' "${legacy_worker}" 2>/dev/null || true)"
-              if [ "${legacy_running}" = "true" ]; then
-                recovered_worker="${legacy_worker}"
-              fi
-            elif docker inspect "${worker_container}" >/dev/null 2>&1; then
-              docker start "${worker_container}" >/dev/null 2>&1 || true
-              sleep 2
-              canonical_running="$(docker inspect -f '{{.State.Running}}' "${worker_container}" 2>/dev/null || true)"
-            fi
-            if [ -n "${recovered_worker}" ]; then
-              docker rm -f "${worker_container}" >/dev/null 2>&1 || true
-              docker rename "${recovered_worker}" "${worker_container}"
-              canonical_running=true
-            fi
-          fi
-          candidate_worker="${legacy_worker}"
-          docker rm -f "${candidate_worker}" >/dev/null 2>&1 || true
-
-          previous_image="$(docker inspect -f '{{.Config.Image}}' "${container}" 2>/dev/null || true)"
-          previous_worker_image="$(docker inspect -f '{{.Config.Image}}' "${current_worker}" 2>/dev/null || true)"
-          web_replaced=0
-          worker_handoff=0
-          release_marker="${app_dir}/release-guard-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.done"
+          # A shared transition plus a generation token makes every detached
+          # guard from an older run harmless before this run mutates Docker.
           rm -f "${release_marker}"
+          touch "${transition_marker}"
+          generation_tmp="${generation_file}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          printf '%s\n' "${generation}" > "${generation_tmp}"
+          chmod 600 "${generation_tmp}"
+          mv -f "${generation_tmp}" "${generation_file}"
 
-          guard_env=(env -i "PATH=${PATH}" "HOME=${HOME}" "RUNNER_TRACKING_ID=precision-release-guard")
+          guard_env=(env -i "PATH=${PATH}" "HOME=${HOME}" "RUNNER_TRACKING_ID=web-release-guard")
           [ -z "${DOCKER_HOST:-}" ] || guard_env+=("DOCKER_HOST=${DOCKER_HOST}")
           [ -z "${XDG_RUNTIME_DIR:-}" ] || guard_env+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}")
           "${guard_env[@]}" nohup bash -c '
             marker="$1"
             web="$2"
-            web_backup="$3"
-            worker="$4"
-            candidate="$5"
-            worker_backup="$6"
-            web_healthy() {
+            backup="$3"
+            transition="$4"
+            generation_file="$5"
+            generation="$6"
+            current_generation() {
+              [ -f "${generation_file}" ] && [ "$(<"${generation_file}")" = "${generation}" ]
+            }
+            healthy() {
               [ "$(docker inspect -f "{{.State.Running}}" "$1" 2>/dev/null || true)" = "true" ] && \
                 docker exec "$1" python -c \
                   "import json,urllib.request; assert json.load(urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=3)).get(\"status\")==\"ok\"" \
                   >/dev/null 2>&1
             }
-            worker_holds_lock() {
-              for name in "${worker}" "${candidate}" "${worker_backup}"; do
-                if [ "$(docker inspect -f "{{.State.Running}}" "${name}" 2>/dev/null || true)" = "true" ] && \
-                  docker exec "${name}" python -c "import fcntl,sys
-          f=open(\"/data/precision.lock\",\"a+\")
-          try:
-           fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
-          except BlockingIOError:
-           sys.exit(0)
-          sys.exit(1)" >/dev/null 2>&1; then
+            restore() {
+              current_generation || return 2
+              [ -f "${marker}" ] && return 0
+              if docker inspect "${backup}" >/dev/null 2>&1; then
+                if docker inspect "${web}" >/dev/null 2>&1; then
+                  docker rm -f "${web}" >/dev/null 2>&1 || return 1
+                fi
+                docker rename "${backup}" "${web}" >/dev/null 2>&1 || return 1
+              fi
+              docker inspect "${web}" >/dev/null 2>&1 || return 1
+              docker start "${web}" >/dev/null 2>&1 || true
+              for _ in $(seq 1 12); do
+                current_generation || return 2
+                if healthy "${web}"; then
+                  touch "${marker}"
+                  rm -f "${transition}"
                   return 0
                 fi
+                sleep 5
               done
               return 1
             }
+            transition_wait=0
             for _ in $(seq 1 90); do
+              current_generation || exit 0
               [ -f "${marker}" ] && exit 0
-              if ! web_healthy "${web}" && ! web_healthy "${web_backup}"; then
-                if docker inspect "${web_backup}" >/dev/null 2>&1; then
-                  docker stop --time 10 "${web}" >/dev/null 2>&1 || true
-                  docker start "${web_backup}" >/dev/null 2>&1 || true
-                else
-                  docker restart "${web}" >/dev/null 2>&1 || true
-                fi
+              if [ -f "${transition}" ] && [ "${transition_wait}" -lt 36 ]; then
+                transition_wait="$((transition_wait + 1))"
+                sleep 5
+                continue
               fi
-              if ! worker_holds_lock; then
-                docker start "${worker_backup}" >/dev/null 2>&1 || \
-                  docker start "${worker}" >/dev/null 2>&1 || \
-                  docker start "${candidate}" >/dev/null 2>&1 || true
+              if [ -f "${transition}" ]; then
+                if restore; then
+                  exit 0
+                fi
+                sleep 10
+                continue
+              fi
+              if ! healthy "${web}"; then
+                if restore; then
+                  exit 0
+                fi
               fi
               sleep 10
             done
-          ' _ "${release_marker}" "${container}" "${web_backup}" "${worker_container}" \
-            "${candidate_worker}" "${worker_backup}" \
-            >"${app_dir}/release-guard.log" 2>&1 </dev/null &
+          ' _ "${release_marker}" "${container}" "${backup}" "${transition_marker}" \
+            "${generation_file}" "${generation}" \
+            >"${app_dir}/web-release-guard.log" 2>&1 </dev/null &
           guard_pid=$!
           sleep 1
           if ! kill -0 "${guard_pid}" >/dev/null 2>&1; then
-            echo "Release recovery guard failed to start"
+            echo "Web release recovery guard failed to start"
             false
           fi
 
+          web_healthy() {
+            [ "$(docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null || true)" = "true" ] && \
+              docker exec "${container}" python -c \
+                "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)).get('status')=='ok'" \
+                >/dev/null 2>&1
+          }
+
+          web_replaced=0
           rollback_release() {
             rc=$?
             trap - ERR INT TERM
             set +e
-            if [ "${worker_handoff}" -eq 1 ]; then
-              if docker inspect "${worker_backup}" >/dev/null 2>&1; then
-                docker start "${worker_backup}" >/dev/null 2>&1 || true
-                sleep 1
-                docker stop --time 30 "${candidate_worker}" "${worker_container}" >/dev/null 2>&1 || true
-                docker start "${worker_backup}" >/dev/null 2>&1 || true
-                sleep 2
-                if [ "$(docker inspect -f '{{.State.Running}}' "${worker_backup}" 2>/dev/null || true)" != "true" ]; then
-                  docker start "${worker_container}" >/dev/null 2>&1 || \
-                    docker start "${candidate_worker}" >/dev/null 2>&1 || true
-                fi
-              elif [ -n "${previous_worker_image}" ]; then
-                docker stop --time 30 "${candidate_worker}" >/dev/null 2>&1 || true
-                docker start "${worker_container}" >/dev/null 2>&1 || \
-                  docker start "${candidate_worker}" >/dev/null 2>&1 || true
-              else
-                docker start "${worker_container}" >/dev/null 2>&1 || \
-                  docker start "${candidate_worker}" >/dev/null 2>&1 || true
-              fi
-            else
-              docker rm -f "${candidate_worker}" >/dev/null 2>&1 || true
-            fi
             if [ "${web_replaced}" -eq 1 ]; then
-              if docker inspect "${web_backup}" >/dev/null 2>&1; then
-                docker stop --time 30 "${container}" >/dev/null 2>&1 || true
-                docker start "${web_backup}" >/dev/null 2>&1 || true
-                sleep 2
-                if [ "$(docker inspect -f '{{.State.Running}}' "${web_backup}" 2>/dev/null || true)" != "true" ]; then
-                  docker start "${container}" >/dev/null 2>&1 || true
-                fi
-              else
+              if docker inspect "${backup}" >/dev/null 2>&1; then
+                docker rm -f "${container}" >/dev/null 2>&1 || true
+                docker rename "${backup}" "${container}" >/dev/null 2>&1 || true
+                docker start "${container}" >/dev/null 2>&1 || true
+              elif docker inspect "${container}" >/dev/null 2>&1; then
                 docker start "${container}" >/dev/null 2>&1 || true
               fi
+            elif docker inspect "${container}" >/dev/null 2>&1; then
+              docker start "${container}" >/dev/null 2>&1 || true
+            elif docker inspect "${backup}" >/dev/null 2>&1; then
+              docker rename "${backup}" "${container}" >/dev/null 2>&1 || true
+              docker start "${container}" >/dev/null 2>&1 || true
             fi
+            recovered=0
+            for _ in $(seq 1 12); do
+              if web_healthy; then
+                recovered=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "${recovered}" -eq 1 ]; then
+              touch "${release_marker}"
+            fi
+            # Without a verified marker the generation-aware detached guard
+            # keeps retrying recovery immediately after the transition clears.
+            rm -f "${transition_marker}"
             exit "${rc}"
           }
           trap rollback_release ERR INT TERM
 
+          # Recovery of a previous interrupted release happens only after the
+          # new guard and rollback trap are active, so every mutation is covered.
+          canonical_running="$(docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null || true)"
+          if [ "${canonical_running}" != "true" ]; then
+            if docker inspect "${backup}" >/dev/null 2>&1; then
+              if docker inspect "${container}" >/dev/null 2>&1; then
+                docker rm -f "${container}" >/dev/null
+              fi
+              docker rename "${backup}" "${container}"
+              docker start "${container}" >/dev/null
+            elif docker inspect "${container}" >/dev/null 2>&1; then
+              docker start "${container}" >/dev/null
+            fi
+          fi
+
+          touch "${transition_marker}"
+          if docker inspect "${backup}" >/dev/null 2>&1; then
+            docker rm -f "${backup}" >/dev/null
+          fi
+          # Set before the first stop: rollback then covers cancellation both
+          # before and after the canonical container is renamed to backup.
           web_replaced=1
-          docker rm -f "${web_backup}" >/dev/null 2>&1 || true
           if docker inspect "${container}" >/dev/null 2>&1; then
             docker stop --time 30 "${container}"
-            docker rename "${container}" "${web_backup}"
+            docker rename "${container}" "${backup}"
           fi
           docker run -d \
             --name "${container}" \
@@ -312,46 +336,16 @@ jobs:
             sleep 2
           done
           if [ "${healthy}" -ne 1 ]; then
-            docker logs "${container}" || true
-            echo "Web health check failed"
+            docker logs "${container}" >"${RUNNER_TEMP}/web-startup.log" 2>&1 || true
+            echo "Web health check failed; startup details remain private on the runner"
             false
           fi
 
-          docker run -d \
-            --name "${candidate_worker}" \
-            --restart unless-stopped \
-            --env-file "${app_dir}/.env" \
-            -v "${app_dir}/precision-data:/data" \
-            "${image}" python -m classifier.precision_worker --wait-for-lock
-
-          worker_handoff=1
-          docker rm -f "${worker_backup}" >/dev/null 2>&1 || true
-          if [ -n "${previous_worker_image}" ]; then
-            docker stop --time 30 "${current_worker}"
-            docker rename "${current_worker}" "${worker_backup}"
-          fi
-
-          worker_ready=0
-          for _ in $(seq 1 30); do
-            if docker exec "${candidate_worker}" python -c $'import fcntl,sys\nf=open("/data/precision.lock","a+")\ntry:\n fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError:\n sys.exit(0)\nsys.exit(1)' \
-              >/dev/null 2>&1; then
-              worker_ready=1
-              break
-            fi
-            sleep 2
-          done
-          if [ "${worker_ready}" -ne 1 ]; then
-            docker logs "${candidate_worker}" || true
-            echo "Category worker did not acquire its persistent lock"
-            false
-          fi
-
-          docker rename "${candidate_worker}" "${worker_container}"
           touch "${release_marker}"
-          docker rm -f "${worker_backup}" "${web_backup}" >/dev/null 2>&1 || true
+          rm -f "${transition_marker}"
+          docker rm -f "${backup}" >/dev/null 2>&1 || true
           trap - ERR INT TERM
-
-          echo "Web service deployed; durable 2025 category worker is running"
+          echo "Web service deployed; category writes remain owned by hosted backfill"
 
       - name: Remove temporary secret file
         if: always()
