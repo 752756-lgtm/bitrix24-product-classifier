@@ -1,6 +1,8 @@
 name: Deploy call summarizer
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       deal_id:
@@ -18,12 +20,12 @@ concurrency:
 jobs:
   test-and-deploy:
     runs-on: [self-hosted, linux, x64, production]
-    timeout-minutes: 20
+    timeout-minutes: 40
     env:
       BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-      DEAL_ID: ${{ inputs.deal_id }}
+      DEAL_ID: ${{ inputs.deal_id || '314319' }}
 
     steps:
       - name: Checkout
@@ -59,6 +61,14 @@ jobs:
             printf 'WEBHOOK_SECRET=%s\n' "${WEBHOOK_SECRET}"
             printf 'HTTP_TIMEOUT=%s\n' '45'
             printf 'TITLE_MAX_LENGTH=%s\n' '100'
+            printf 'PRECISION_YEAR=%s\n' '2025'
+            printf 'PRECISION_BATCH_SIZE=%s\n' '20'
+            printf 'PRECISION_WRITE_INTERVAL_SECONDS=%s\n' '60'
+            printf 'PRECISION_API_INTERVAL_SECONDS=%s\n' '1.2'
+            printf 'PRECISION_HTTP_TIMEOUT=%s\n' '90'
+            printf 'PRECISION_STATE_PATH=%s\n' '/data/precision.sqlite3'
+            printf 'PRECISION_STATUS_PATH=%s\n' '/data/precision-status.json'
+            printf 'PRECISION_PLAN_KEY_PATH=%s\n' '/data/precision-plan.key'
           } > "${RUNNER_TEMP}/runtime.env"
 
       - name: Build image
@@ -79,23 +89,211 @@ jobs:
             -v "${GITHUB_WORKSPACE}/tests:/app/tests:ro" \
             "${image}" python -m compileall -q classifier tests
 
-      - name: Dry-run deal and deploy
+      - name: Dry-run deal and deploy services
         shell: bash
         run: |
           set -Eeuo pipefail
           app_dir="${HOME}/.local/share/bitrix24-call-summarizer"
           container="bitrix24-call-summarizer"
+          worker_container="bitrix24-category-backfill-2025"
           image="bitrix24-call-summarizer:${GITHUB_SHA}"
 
           install -d -m 700 "${app_dir}"
+          install -d -m 700 "${app_dir}/precision-data"
           install -m 600 "${RUNNER_TEMP}/runtime.env" "${app_dir}/.env"
 
           echo "Running mandatory dry-run for deal ${DEAL_ID}"
           docker run --rm --env-file "${app_dir}/.env" "${image}" \
             python -m classifier.backfill --deal-id "${DEAL_ID}"
 
+          echo "Validating worker metadata and persistent state without CRM writes"
+          worker_config_ok=0
+          for attempt in 1 2 3; do
+            if docker run --rm \
+              --env-file "${app_dir}/.env" \
+              -v "${app_dir}/precision-data:/data" \
+              "${image}" python -m classifier.precision_worker --check-config \
+              --lock /tmp/precision-check.lock --status /tmp/precision-check-status.json; then
+              worker_config_ok=1
+              break
+            fi
+            sleep "$((attempt * 20))"
+          done
+          if [ "${worker_config_ok}" -ne 1 ]; then
+            echo "Worker metadata validation failed after three attempts"
+            false
+          fi
+
+          legacy_worker="${worker_container}-next"
+          worker_backup="${worker_container}-previous"
+          web_backup="${container}-previous"
+          current_worker="${worker_container}"
+
+          canonical_web_running="$(docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null || true)"
+          web_backup_running="$(docker inspect -f '{{.State.Running}}' "${web_backup}" 2>/dev/null || true)"
+          if [ "${canonical_web_running}" != "true" ] && docker inspect "${web_backup}" >/dev/null 2>&1; then
+            if [ "${web_backup_running}" != "true" ]; then
+              docker start "${web_backup}" >/dev/null 2>&1 || true
+              sleep 2
+              web_backup_running="$(docker inspect -f '{{.State.Running}}' "${web_backup}" 2>/dev/null || true)"
+            fi
+            if [ "${web_backup_running}" = "true" ]; then
+              docker rm -f "${container}" >/dev/null 2>&1 || true
+              docker rename "${web_backup}" "${container}"
+              canonical_web_running=true
+            fi
+          fi
+
+          canonical_running="$(docker inspect -f '{{.State.Running}}' "${worker_container}" 2>/dev/null || true)"
+          legacy_running="$(docker inspect -f '{{.State.Running}}' "${legacy_worker}" 2>/dev/null || true)"
+          backup_running="$(docker inspect -f '{{.State.Running}}' "${worker_backup}" 2>/dev/null || true)"
+          if [ "${canonical_running}" != "true" ]; then
+            recovered_worker=""
+            if [ "${backup_running}" = "true" ]; then
+              recovered_worker="${worker_backup}"
+            elif [ "${legacy_running}" = "true" ]; then
+              recovered_worker="${legacy_worker}"
+            elif docker inspect "${worker_backup}" >/dev/null 2>&1; then
+              docker start "${worker_backup}" >/dev/null 2>&1 || true
+              sleep 2
+              backup_running="$(docker inspect -f '{{.State.Running}}' "${worker_backup}" 2>/dev/null || true)"
+              if [ "${backup_running}" = "true" ]; then
+                recovered_worker="${worker_backup}"
+              fi
+            elif docker inspect "${legacy_worker}" >/dev/null 2>&1; then
+              docker start "${legacy_worker}" >/dev/null 2>&1 || true
+              sleep 2
+              legacy_running="$(docker inspect -f '{{.State.Running}}' "${legacy_worker}" 2>/dev/null || true)"
+              if [ "${legacy_running}" = "true" ]; then
+                recovered_worker="${legacy_worker}"
+              fi
+            elif docker inspect "${worker_container}" >/dev/null 2>&1; then
+              docker start "${worker_container}" >/dev/null 2>&1 || true
+              sleep 2
+              canonical_running="$(docker inspect -f '{{.State.Running}}' "${worker_container}" 2>/dev/null || true)"
+            fi
+            if [ -n "${recovered_worker}" ]; then
+              docker rm -f "${worker_container}" >/dev/null 2>&1 || true
+              docker rename "${recovered_worker}" "${worker_container}"
+              canonical_running=true
+            fi
+          fi
+          candidate_worker="${legacy_worker}"
+          docker rm -f "${candidate_worker}" >/dev/null 2>&1 || true
+
           previous_image="$(docker inspect -f '{{.Config.Image}}' "${container}" 2>/dev/null || true)"
-          docker rm -f "${container}" >/dev/null 2>&1 || true
+          previous_worker_image="$(docker inspect -f '{{.Config.Image}}' "${current_worker}" 2>/dev/null || true)"
+          web_replaced=0
+          worker_handoff=0
+          release_marker="${app_dir}/release-guard-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.done"
+          rm -f "${release_marker}"
+
+          guard_env=(env -i "PATH=${PATH}" "HOME=${HOME}" "RUNNER_TRACKING_ID=precision-release-guard")
+          [ -z "${DOCKER_HOST:-}" ] || guard_env+=("DOCKER_HOST=${DOCKER_HOST}")
+          [ -z "${XDG_RUNTIME_DIR:-}" ] || guard_env+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}")
+          "${guard_env[@]}" nohup bash -c '
+            marker="$1"
+            web="$2"
+            web_backup="$3"
+            worker="$4"
+            candidate="$5"
+            worker_backup="$6"
+            web_healthy() {
+              [ "$(docker inspect -f "{{.State.Running}}" "$1" 2>/dev/null || true)" = "true" ] && \
+                docker exec "$1" python -c \
+                  "import json,urllib.request; assert json.load(urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=3)).get(\"status\")==\"ok\"" \
+                  >/dev/null 2>&1
+            }
+            worker_holds_lock() {
+              for name in "${worker}" "${candidate}" "${worker_backup}"; do
+                if [ "$(docker inspect -f "{{.State.Running}}" "${name}" 2>/dev/null || true)" = "true" ] && \
+                  docker exec "${name}" python -c "import fcntl,sys
+          f=open(\"/data/precision.lock\",\"a+\")
+          try:
+           fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+          except BlockingIOError:
+           sys.exit(0)
+          sys.exit(1)" >/dev/null 2>&1; then
+                  return 0
+                fi
+              done
+              return 1
+            }
+            for _ in $(seq 1 90); do
+              [ -f "${marker}" ] && exit 0
+              if ! web_healthy "${web}" && ! web_healthy "${web_backup}"; then
+                if docker inspect "${web_backup}" >/dev/null 2>&1; then
+                  docker stop --time 10 "${web}" >/dev/null 2>&1 || true
+                  docker start "${web_backup}" >/dev/null 2>&1 || true
+                else
+                  docker restart "${web}" >/dev/null 2>&1 || true
+                fi
+              fi
+              if ! worker_holds_lock; then
+                docker start "${worker_backup}" >/dev/null 2>&1 || \
+                  docker start "${worker}" >/dev/null 2>&1 || \
+                  docker start "${candidate}" >/dev/null 2>&1 || true
+              fi
+              sleep 10
+            done
+          ' _ "${release_marker}" "${container}" "${web_backup}" "${worker_container}" \
+            "${candidate_worker}" "${worker_backup}" \
+            >"${app_dir}/release-guard.log" 2>&1 </dev/null &
+          guard_pid=$!
+          sleep 1
+          if ! kill -0 "${guard_pid}" >/dev/null 2>&1; then
+            echo "Release recovery guard failed to start"
+            false
+          fi
+
+          rollback_release() {
+            rc=$?
+            trap - ERR INT TERM
+            set +e
+            if [ "${worker_handoff}" -eq 1 ]; then
+              if docker inspect "${worker_backup}" >/dev/null 2>&1; then
+                docker start "${worker_backup}" >/dev/null 2>&1 || true
+                sleep 1
+                docker stop --time 30 "${candidate_worker}" "${worker_container}" >/dev/null 2>&1 || true
+                docker start "${worker_backup}" >/dev/null 2>&1 || true
+                sleep 2
+                if [ "$(docker inspect -f '{{.State.Running}}' "${worker_backup}" 2>/dev/null || true)" != "true" ]; then
+                  docker start "${worker_container}" >/dev/null 2>&1 || \
+                    docker start "${candidate_worker}" >/dev/null 2>&1 || true
+                fi
+              elif [ -n "${previous_worker_image}" ]; then
+                docker stop --time 30 "${candidate_worker}" >/dev/null 2>&1 || true
+                docker start "${worker_container}" >/dev/null 2>&1 || \
+                  docker start "${candidate_worker}" >/dev/null 2>&1 || true
+              else
+                docker start "${worker_container}" >/dev/null 2>&1 || \
+                  docker start "${candidate_worker}" >/dev/null 2>&1 || true
+              fi
+            else
+              docker rm -f "${candidate_worker}" >/dev/null 2>&1 || true
+            fi
+            if [ "${web_replaced}" -eq 1 ]; then
+              if docker inspect "${web_backup}" >/dev/null 2>&1; then
+                docker stop --time 30 "${container}" >/dev/null 2>&1 || true
+                docker start "${web_backup}" >/dev/null 2>&1 || true
+                sleep 2
+                if [ "$(docker inspect -f '{{.State.Running}}' "${web_backup}" 2>/dev/null || true)" != "true" ]; then
+                  docker start "${container}" >/dev/null 2>&1 || true
+                fi
+              else
+                docker start "${container}" >/dev/null 2>&1 || true
+              fi
+            fi
+            exit "${rc}"
+          }
+          trap rollback_release ERR INT TERM
+
+          web_replaced=1
+          docker rm -f "${web_backup}" >/dev/null 2>&1 || true
+          if docker inspect "${container}" >/dev/null 2>&1; then
+            docker stop --time 30 "${container}"
+            docker rename "${container}" "${web_backup}"
+          fi
           docker run -d \
             --name "${container}" \
             --restart unless-stopped \
@@ -113,23 +311,47 @@ jobs:
             fi
             sleep 2
           done
-
           if [ "${healthy}" -ne 1 ]; then
             docker logs "${container}" || true
-            docker rm -f "${container}" >/dev/null 2>&1 || true
-            if [ -n "${previous_image}" ]; then
-              docker run -d \
-                --name "${container}" \
-                --restart unless-stopped \
-                --env-file "${app_dir}/.env" \
-                -p 127.0.0.1:8080:8080 \
-                "${previous_image}" || true
-            fi
-            echo "Health check failed; deployment rolled back"
-            exit 1
+            echo "Web health check failed"
+            false
           fi
 
-          echo "Deployment succeeded; CRM was not modified"
+          docker run -d \
+            --name "${candidate_worker}" \
+            --restart unless-stopped \
+            --env-file "${app_dir}/.env" \
+            -v "${app_dir}/precision-data:/data" \
+            "${image}" python -m classifier.precision_worker --wait-for-lock
+
+          worker_handoff=1
+          docker rm -f "${worker_backup}" >/dev/null 2>&1 || true
+          if [ -n "${previous_worker_image}" ]; then
+            docker stop --time 30 "${current_worker}"
+            docker rename "${current_worker}" "${worker_backup}"
+          fi
+
+          worker_ready=0
+          for _ in $(seq 1 30); do
+            if docker exec "${candidate_worker}" python -c $'import fcntl,sys\nf=open("/data/precision.lock","a+")\ntry:\n fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError:\n sys.exit(0)\nsys.exit(1)' \
+              >/dev/null 2>&1; then
+              worker_ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${worker_ready}" -ne 1 ]; then
+            docker logs "${candidate_worker}" || true
+            echo "Category worker did not acquire its persistent lock"
+            false
+          fi
+
+          docker rename "${candidate_worker}" "${worker_container}"
+          touch "${release_marker}"
+          docker rm -f "${worker_backup}" "${web_backup}" >/dev/null 2>&1 || true
+          trap - ERR INT TERM
+
+          echo "Web service deployed; durable 2025 category worker is running"
 
       - name: Remove temporary secret file
         if: always()
