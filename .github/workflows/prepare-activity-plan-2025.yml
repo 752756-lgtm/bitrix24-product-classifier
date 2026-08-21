@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       max_deals:
-        description: "Maximum remaining deals to inspect; 0 means all"
+        description: "Maximum remaining deals to inspect; keep 30 for the next bounded diagnostic run"
         required: true
-        default: "0"
+        default: "30"
         type: string
       deterministic_only:
         description: "Skip OpenAI; defer rows not accepted by strict deterministic rules"
@@ -160,6 +160,7 @@ jobs:
             echo "PRIVATE_PRODUCTS=${private_dir}/products.json"
             echo "PRIVATE_CHECKPOINT=${private_dir}/checkpoint.json"
             echo "PRIVATE_STATUS=${private_dir}/preparation-status.json"
+            echo "PRIVATE_DIAGNOSTICS=${private_dir}/preparation-diagnostics.json"
             echo "PRIVATE_LOG=${private_dir}/preparation.log"
             echo "PUBLIC_ALLOWLIST=${private_dir}/precision-2025.allowlist"
             echo "PUBLIC_TAXONOMY=${private_dir}/precision-2025-taxonomy.json"
@@ -185,6 +186,7 @@ jobs:
             --products "${PRIVATE_PRODUCTS}"
             --checkpoint "${PRIVATE_CHECKPOINT}"
             --status "${PRIVATE_STATUS}"
+            --diagnostics "${PRIVATE_DIAGNOSTICS}"
             --max-deals "${MAX_DEALS}"
             --model-workers 5
             --api-call-cap 12000
@@ -196,10 +198,101 @@ jobs:
           if [ "${INCLUDE_CATEGORY_PRESENT}" = "true" ]; then
             args+=(--include-category-present)
           fi
-          if ! python -m classifier.activity_prepare "${args[@]}" \
-            > "${PRIVATE_LOG}" 2>&1; then
-            echo "::error::Activity preparation failed; private log remains runner-local"
-            exit 1
+          preparation_rc=0
+          python -m classifier.activity_prepare "${args[@]}" \
+            > "${PRIVATE_LOG}" 2>&1 || preparation_rc=$?
+          if [ "${preparation_rc}" -ne 0 ]; then
+            python - "${PRIVATE_DIAGNOSTICS}" "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json
+          import stat
+          import sys
+          from pathlib import Path
+
+          from classifier.activity_prepare import (
+              DIAGNOSTIC_FAILURE_CODES,
+              DIAGNOSTIC_FORMAT,
+              DIAGNOSTIC_STAGES,
+              PreparationStats,
+          )
+
+          stage = "diagnostic_unavailable"
+          code = "diagnostic_unavailable"
+          counters = {}
+          try:
+              path = Path(sys.argv[1])
+              mode = path.lstat().st_mode
+              if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or mode & 0o077:
+                  raise ValueError
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              expected_keys = {
+                  "format", "outcome", "failure_stage", "failure_code", "stats", "taxonomy"
+              }
+              if not isinstance(payload, dict) or set(payload) != expected_keys:
+                  raise ValueError
+              if payload["format"] != DIAGNOSTIC_FORMAT:
+                  raise ValueError
+              if payload["failure_stage"] not in DIAGNOSTIC_STAGES:
+                  raise ValueError
+              if payload["outcome"] == "failure":
+                  if (
+                      payload["failure_code"] not in DIAGNOSTIC_FAILURE_CODES
+                      or payload["failure_code"] == "none"
+                  ):
+                      raise ValueError
+                  code = payload["failure_code"]
+              elif payload["outcome"] == "running":
+                  if payload["failure_code"] != "none":
+                      raise ValueError
+                  code = "process_terminated"
+              else:
+                  raise ValueError
+              safe_counter_names = set(PreparationStats().__dict__)
+              stats_value = payload["stats"]
+              taxonomy_value = payload["taxonomy"]
+              if (
+                  not isinstance(stats_value, dict)
+                  or set(stats_value) != safe_counter_names
+                  or any(type(value) is not int or value < 0 for value in stats_value.values())
+                  or not isinstance(taxonomy_value, dict)
+                  or set(taxonomy_value) != {"categories", "subcategories", "pairs"}
+                  or any(type(value) is not int or value < 0 for value in taxonomy_value.values())
+              ):
+                  raise ValueError
+              stage = payload["failure_stage"]
+              counters = {
+                  "scanned": stats_value["scanned"],
+                  "remaining": stats_value["remaining"],
+                  "accepted": (
+                      stats_value["accepted_full_pair"]
+                      + stats_value["accepted_category_only"]
+                  ),
+                  "bitrix_api_calls": stats_value["bitrix_api_calls"],
+                  "bitrix_api_call_cap": stats_value["bitrix_api_call_cap"],
+              }
+          except (OSError, TypeError, ValueError, json.JSONDecodeError):
+              pass
+
+          summary_path = Path(sys.argv[2])
+          with summary_path.open("a", encoding="utf-8") as handle:
+              handle.write("## Activity-v5 preparation failure\n\n")
+              handle.write(f"- Failure stage: `{stage}`\n")
+              handle.write(f"- Failure code: `{code}`\n")
+              if counters:
+                  handle.write(f"- Deals scanned: {counters['scanned']}\n")
+                  handle.write(f"- Remaining target scope: {counters['remaining']}\n")
+                  handle.write(f"- Accepted before failure: {counters['accepted']}\n")
+                  handle.write(
+                      "- Bitrix API calls/cap: "
+                      f"{counters['bitrix_api_calls']}/"
+                      f"{counters['bitrix_api_call_cap']}\n"
+                  )
+              handle.write("- Raw activity evidence and API descriptions were not published\n")
+          print(
+              "::error::Activity preparation failed: "
+              f"stage={stage}; code={code}; private log remains runner-local"
+          )
+          PY
+            exit "${preparation_rc}"
           fi
 
       - name: Generate signed v5 assets in runner temp
