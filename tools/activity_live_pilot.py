@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -22,10 +23,15 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from classifier.bitrix import BitrixClient
 from classifier.precision_plan import (
+    MAX_RELEVANT_ACTIVITIES,
     activity_is_bound_to_deal,
     activity_kind,
+    canonical_activity_evidence,
     canonical_activity_index,
 )
 from classifier.precision_worker import (
@@ -52,6 +58,12 @@ READ_ONLY_METHODS = frozenset(
 )
 METHOD_NOT_ALLOWED = "ERROR_BATCH_METHOD_NOT_ALLOWED"
 SAFE_CODE_RE = re.compile(r"^[A-Z0-9_]{1,80}$")
+MIN_SAFE_INTERVAL_SECONDS = 1.2
+MAX_SAFE_DISCOVERY_PAGES = 600
+MAX_SAFE_ACTIVITY_PAGES = 20
+MAX_SAFE_CONTENT_ROWS = 20
+MAX_SAFE_INTERVAL_SECONDS = 10.0
+MAX_SAFE_DIRECT_COMPARE = 5
 
 
 class PilotError(RuntimeError):
@@ -63,6 +75,40 @@ class PilotApiError(PilotError):
         super().__init__(f"{method} failed ({code})")
         self.method = method
         self.code = code
+
+
+def _validate_operational_limits(
+    *,
+    min_interval: float,
+    sample_size: int,
+    max_discovery_pages: int,
+    activity_batch_size: int,
+    max_activity_pages: int,
+    direct_compare_count: int,
+    max_emails: int,
+    max_calls: int,
+) -> None:
+    if not 20 <= sample_size <= 50:
+        raise PilotError("Pilot sample size is outside the safe range")
+    if not 1 <= activity_batch_size <= 20:
+        raise PilotError("Activity batch size is outside the safe range")
+    if not 1 <= direct_compare_count <= min(sample_size, MAX_SAFE_DIRECT_COMPARE):
+        raise PilotError("Direct compare count is outside the safe range")
+    if not 1 <= max_emails <= 20 or not 1 <= max_calls <= 20:
+        raise PilotError("Content sample size is outside the safe range")
+    if max_emails + max_calls > MAX_SAFE_CONTENT_ROWS:
+        raise PilotError("Activity content batch exceeds the safe response-size cap")
+    if not 1 <= max_discovery_pages <= MAX_SAFE_DISCOVERY_PAGES:
+        raise PilotError("Deal discovery page limit is outside the safe range")
+    if not 1 <= max_activity_pages <= MAX_SAFE_ACTIVITY_PAGES:
+        raise PilotError("Activity page limit is outside the safe range")
+    if (
+        not math.isfinite(min_interval)
+        or not MIN_SAFE_INTERVAL_SECONDS
+        <= min_interval
+        <= MAX_SAFE_INTERVAL_SECONDS
+    ):
+        raise PilotError("API call interval is outside the safe bounds")
 
 
 def _safe_error_code(value: object) -> str:
@@ -368,6 +414,8 @@ def _list_one_direct(
         raw_rows += len(page)
         binding_only += page_binding_only
         relevant.extend(page_relevant)
+        if len(relevant) > MAX_RELEVANT_ACTIVITIES:
+            raise PilotError("Relevant activity protocol cap was exceeded")
         if len(page) < ACTIVITY_PAGE_SIZE:
             return relevant, {
                 "pages": pages,
@@ -442,6 +490,8 @@ def list_activities_batched(
                 raw_rows += len(page)
                 binding_only += page_binding_only
                 relevant[deal_id].extend(rows)
+                if len(relevant[deal_id]) > MAX_RELEVANT_ACTIVITIES:
+                    raise PilotError("Relevant activity protocol cap was exceeded")
                 if len(page) == ACTIVITY_PAGE_SIZE:
                     if page_last <= last_ids[deal_id]:
                         raise PilotError("Activity keyset cursor did not advance")
@@ -585,6 +635,35 @@ def fetch_activity_details(
                 raise PilotError("Activity-get changed incoming-email scope")
         elif activity_kind(detail) != "call":
             raise PilotError("Activity-get changed call scope")
+        probe_detail = dict(detail)
+        if "SUBJECT" in probe_detail:
+            probe_detail["SUBJECT"] = "shape-probe"
+        elif "subject" in probe_detail:
+            probe_detail["subject"] = "shape-probe"
+        if kind == "email":
+            if "DESCRIPTION" in probe_detail:
+                probe_detail["DESCRIPTION"] = "shape-probe"
+            elif "description" in probe_detail:
+                probe_detail["description"] = "shape-probe"
+        selected_probe: dict[str, object] = {
+            "kind": kind,
+            "activity": probe_detail,
+        }
+        if kind == "call":
+            selected_probe["transcription"] = "shape-probe"
+        try:
+            # Reuse the production v5 canonicalizer so the pilot cannot report
+            # ready when crm.activity.get omits a required metadata field or
+            # supplies bindings that disagree with the signed list snapshot.
+            canonical_activity_evidence(
+                deal_id,
+                [index_row],
+                [selected_probe],
+            )
+        except ValueError:
+            raise PilotError(
+                "Activity-get snapshot was incompatible with activity-v5"
+            ) from None
         fetched.append((deal_id, kind, index_row, detail))
 
     direct_compare: bool | None = None
@@ -612,8 +691,14 @@ def _transcript_nonempty(value: Any) -> bool:
         return False
     if not isinstance(value, dict):
         raise PilotError("Unexpected transcript response shape")
+    if "transcription" not in value:
+        raise PilotError("Unexpected transcript response shape")
     text = value.get("transcription")
-    return text is not None and text is not False and bool(str(text).strip())
+    if text is None or text is False:
+        return False
+    if not isinstance(text, str):
+        raise PilotError("Unexpected transcript response shape")
+    return bool(text.strip())
 
 
 def probe_transcripts(
@@ -692,23 +777,58 @@ def probe_transcripts(
 def _private_write(path: Path, value: dict[str, object]) -> None:
     if not path.is_absolute():
         raise PilotError("Pilot report path must be absolute")
-    resolved_parent = path.parent.resolve()
-    if resolved_parent != Path("/tmp") and Path("/tmp") not in resolved_parent.parents:
-        raise PilotError("Pilot report must be under /tmp")
-    resolved_parent.mkdir(parents=True, exist_ok=True)
-    temporary = resolved_parent / f".{path.name}.{os.getpid()}.tmp"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    tmp_root = Path("/tmp").resolve(strict=True)
     try:
+        resolved_parent = path.parent.resolve(strict=True)
+        relative_parent = resolved_parent.relative_to(tmp_root)
+    except (OSError, ValueError):
+        raise PilotError("Pilot report parent must already exist under /tmp") from None
+    if path.name in {"", ".", ".."}:
+        raise PilotError("Pilot report filename is invalid")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(tmp_root, directory_flags)
+    try:
+        for part in relative_parent.parts:
+            previous_fd = directory_fd
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            directory_fd = next_fd
+            os.close(previous_fd)
+    except Exception:
+        os.close(directory_fd)
+        raise PilotError("Pilot report parent was not a safe directory") from None
+
+    temporary_name = f".{path.name}.{os.getpid()}.tmp"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
             json.dump(value, handle, ensure_ascii=False, sort_keys=True, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
 
 
 def _assert_aggregate_report(value: object) -> None:
@@ -751,6 +871,16 @@ def run_pilot(
     max_emails: int,
     max_calls: int,
 ) -> dict[str, object]:
+    _validate_operational_limits(
+        min_interval=client.min_interval,
+        sample_size=sample_size,
+        max_discovery_pages=max_discovery_pages,
+        activity_batch_size=activity_batch_size,
+        max_activity_pages=max_activity_pages,
+        direct_compare_count=direct_compare_count,
+        max_emails=max_emails,
+        max_calls=max_calls,
+    )
     excluded = resolve_excluded_stage_ids(client)
     deal_ids, discovery = discover_remaining_deals(
         client,
@@ -856,18 +986,21 @@ def main() -> int:
 
     if not args.confirm_writer_terminal:
         parser.error("--confirm-writer-terminal is required")
-    if not 20 <= args.sample_size <= 50:
-        parser.error("--sample-size must be between 20 and 50")
-    if not 1 <= args.activity_batch_size <= 20:
-        parser.error("--activity-batch-size must be between 1 and 20")
-    if not 1 <= args.direct_compare_count <= args.sample_size:
-        parser.error("--direct-compare-count is outside the sample")
-    if not 1 <= args.max_emails <= 20 or not 1 <= args.max_calls <= 20:
-        parser.error("--max-emails and --max-calls must be between 1 and 20")
-    if args.max_discovery_pages <= 0 or args.max_activity_pages <= 0:
-        parser.error("page limits must be positive")
-    if args.timeout <= 0 or args.min_interval < 0:
-        parser.error("timeout/interval values are invalid")
+    if not 1 <= args.timeout <= 180:
+        parser.error("--timeout must be between 1 and 180 seconds")
+    try:
+        _validate_operational_limits(
+            min_interval=args.min_interval,
+            sample_size=args.sample_size,
+            max_discovery_pages=args.max_discovery_pages,
+            activity_batch_size=args.activity_batch_size,
+            max_activity_pages=args.max_activity_pages,
+            direct_compare_count=args.direct_compare_count,
+            max_emails=args.max_emails,
+            max_calls=args.max_calls,
+        )
+    except PilotError as exc:
+        parser.error(str(exc))
 
     webhook = os.getenv("BITRIX_WEBHOOK_URL", "").strip()
     if not webhook or not _valid_webhook(webhook):
@@ -907,7 +1040,7 @@ def main() -> int:
         "ready": report["verdict"]["ready_for_limited_private_activity_plan"],
     }
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
-    print(f"private aggregate report: {args.output}")
+    print("private aggregate report written")
     return 0 if summary["ready"] else 3
 
 

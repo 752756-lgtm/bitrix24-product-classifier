@@ -2,20 +2,46 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from tools.activity_live_pilot import (
     PilotError,
     ReadOnlyRateLimitedClient,
     _private_write,
+    _validate_operational_limits,
+    list_activities_batched,
     run_pilot,
 )
 
 
 PRIVATE_SENTINEL = "PRIVATE-ACTIVITY-EVIDENCE-SENTINEL"
+
+
+class Clock:
+    def __init__(self):
+        self.value = 0.0
+
+    def monotonic(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.value += seconds
+
+
+def pilot_client(transport: object) -> ReadOnlyRateLimitedClient:
+    clock = Clock()
+    return ReadOnlyRateLimitedClient(
+        transport,
+        1.2,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
 
 
 def activity_row(deal_id: int, kind: str) -> dict[str, object]:
@@ -132,7 +158,7 @@ class ActivityLivePilotTests(unittest.TestCase):
 
     def test_full_pilot_persists_only_aggregate_shapes(self):
         transport = FakeTransport()
-        client = ReadOnlyRateLimitedClient(transport, 0)
+        client = pilot_client(transport)
         report = run_pilot(
             client,
             year=2025,
@@ -164,23 +190,21 @@ class ActivityLivePilotTests(unittest.TestCase):
     def test_private_report_is_atomic_mode_0600_and_limited_to_tmp(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             output = Path(directory) / "report.json"
-            _private_write(output, {"safe": True})
+            with patch(
+                "tools.activity_live_pilot.os.replace", wraps=os.replace
+            ) as replace:
+                _private_write(output, {"safe": True})
+            self.assertIsInstance(replace.call_args.kwargs["src_dir_fd"], int)
+            self.assertEqual(
+                replace.call_args.kwargs["src_dir_fd"],
+                replace.call_args.kwargs["dst_dir_fd"],
+            )
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(output.read_text()), {"safe": True})
         with self.assertRaisesRegex(PilotError, "under /tmp"):
             _private_write(Path("/workspace/not-private.json"), {"safe": True})
 
     def test_rate_spacing_is_measured_without_triggering_quota(self):
-        class Clock:
-            def __init__(self):
-                self.value = 0.0
-
-            def monotonic(self):
-                return self.value
-
-            def sleep(self, seconds):
-                self.value += seconds
-
         clock = Clock()
         transport = FakeTransport()
         client = ReadOnlyRateLimitedClient(
@@ -194,6 +218,137 @@ class ActivityLivePilotTests(unittest.TestCase):
         self.assertAlmostEqual(
             client.spacing_report()["minimum_observed_start_gap_seconds"], 1.2
         )
+
+    def test_activity_get_must_match_the_production_v5_snapshot_shape(self):
+        class MissingMetadataTransport(FakeTransport):
+            def _activity_detail(self, activity_id: str) -> dict[str, object]:
+                detail = super()._activity_detail(activity_id)
+                detail.pop("PROVIDER_TYPE_ID")
+                return detail
+
+        class MismatchedBindingsTransport(FakeTransport):
+            def _activity_detail(self, activity_id: str) -> dict[str, object]:
+                detail = super()._activity_detail(activity_id)
+                deal_id, _kind, _row = self.by_activity_id[activity_id]
+                detail["BINDINGS"] = [
+                    {"OWNER_TYPE_ID": "2", "OWNER_ID": str(deal_id)},
+                    {"OWNER_TYPE_ID": "3", "OWNER_ID": "999"},
+                ]
+                return detail
+
+        for transport_type in (MissingMetadataTransport, MismatchedBindingsTransport):
+            with self.subTest(transport=transport_type.__name__):
+                with self.assertRaisesRegex(PilotError, "activity-v5"):
+                    run_pilot(
+                        pilot_client(transport_type()),
+                        year=2025,
+                        sample_size=20,
+                        max_discovery_pages=5,
+                        activity_batch_size=20,
+                        max_activity_pages=5,
+                        direct_compare_count=3,
+                        max_emails=10,
+                        max_calls=10,
+                    )
+
+    def test_malformed_transcript_object_cannot_produce_ready_verdict(self):
+        class MalformedTranscriptTransport(FakeTransport):
+            def _transcript(self, activity_id: str) -> dict[str, str]:
+                if activity_id not in self.by_activity_id:
+                    raise AssertionError("unknown activity")
+                return {}
+
+        with self.assertRaisesRegex(PilotError, "transcript response shape"):
+            run_pilot(
+                pilot_client(MalformedTranscriptTransport()),
+                year=2025,
+                sample_size=20,
+                max_discovery_pages=5,
+                activity_batch_size=20,
+                max_activity_pages=5,
+                direct_compare_count=3,
+                max_emails=10,
+                max_calls=10,
+            )
+
+    def test_operational_limits_reject_quota_and_response_size_bypass(self):
+        safe = {
+            "min_interval": 1.2,
+            "sample_size": 20,
+            "max_discovery_pages": 100,
+            "activity_batch_size": 20,
+            "max_activity_pages": 20,
+            "direct_compare_count": 3,
+            "max_emails": 10,
+            "max_calls": 10,
+        }
+        _validate_operational_limits(**safe)
+        for field, unsafe_value in (
+            ("min_interval", 0.0),
+            ("min_interval", float("inf")),
+            ("max_discovery_pages", 601),
+            ("max_activity_pages", 21),
+            ("direct_compare_count", 6),
+            ("max_emails", 11),
+        ):
+            values = dict(safe)
+            values[field] = unsafe_value
+            with self.subTest(field=field):
+                with self.assertRaises(PilotError):
+                    _validate_operational_limits(**values)
+
+    def test_activity_index_cannot_exceed_the_v5_protocol_memory_cap(self):
+        class OverCapTransport:
+            def __init__(self):
+                self.rows = []
+                for offset in range(101):
+                    row = activity_row(31001, "email")
+                    row["ID"] = str(500001 + offset)
+                    self.rows.append(row)
+
+            def call(self, method: str, params: dict[str, object]):
+                if method != "batch":
+                    raise AssertionError(f"unexpected method: {method}")
+                results = {}
+                for name, command in params["cmd"].items():
+                    parsed = urlsplit(command)
+                    query = parse_qs(parsed.query)
+                    last_id = int(query["filter[>ID]"][0])
+                    results[name] = [
+                        row for row in self.rows if int(row["ID"]) > last_id
+                    ][:50]
+                return {"result": results, "result_error": {}}
+
+        with self.assertRaisesRegex(PilotError, "protocol cap"):
+            list_activities_batched(
+                pilot_client(OverCapTransport()),
+                [31001],
+                batch_size=1,
+                max_pages=5,
+            )
+
+    def test_direct_cli_bootstraps_repo_imports_before_live_validation(self):
+        script = Path(__file__).resolve().parents[1] / "tools/activity_live_pilot.py"
+        environment = dict(os.environ)
+        environment.pop("BITRIX_WEBHOOK_URL", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--confirm-writer-terminal",
+                "--min-interval",
+                "0",
+            ],
+            cwd="/tmp",
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("API call interval is outside the safe bounds", result.stderr)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":
