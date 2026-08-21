@@ -22,6 +22,15 @@ on:
         required: true
         default: false
         type: boolean
+  # Temporary one-shot bridge for environments that cannot call
+  # workflow_dispatch. The marker must be newly added, byte-exact, and this
+  # must be run attempt 1. Cleanup removes this stanza and the marker in the
+  # same commit; even an old-workflow evaluation rejects the marker deletion.
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflow-triggers/prepare-activity-plan-2025-32509765967.trigger"
 
 permissions:
   contents: read
@@ -35,6 +44,9 @@ concurrency:
 
 jobs:
   prepare:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
@@ -45,6 +57,12 @@ jobs:
       OPENAI_MODEL: gpt-5.6-luna
       ACTIVITY_PREP_HTTP_TIMEOUT: "90"
       ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
+      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2025-32509765967.trigger
+      ONE_SHOT_MARKER_SHA256: d1e73e8db0b1166ced9ed72d9cd13700112babfa533380c13b676cea3c35f20f
+      EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'push' && '32509765967' || inputs.writer_run_id }}
+      MAX_DEALS: ${{ github.event_name == 'push' && '0' || inputs.max_deals }}
+      DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'false' || inputs.deterministic_only }}
+      INCLUDE_CATEGORY_PRESENT: ${{ github.event_name == 'push' && 'false' || inputs.include_category_present }}
     steps:
       - name: Checkout main without persisted credentials
         uses: actions/checkout@v4
@@ -53,9 +71,107 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Fail closed unless this is an exact authorized invocation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Preparation workflow is restricted to main"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]; then
+            echo "::error::main advanced before checkout; refusing a stale invocation"
+            exit 1
+          fi
+          if [[ ! "${EXPECTED_WRITER_RUN_ID}" =~ ^[0-9]+$ ]] || \
+             [[ ! "${MAX_DEALS}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Effective numeric inputs are malformed"
+            exit 1
+          fi
+          case "${DETERMINISTIC_ONLY}:${INCLUDE_CATEGORY_PRESENT}" in
+            true:true|true:false|false:true|false:false)
+              ;;
+            *)
+              echo "::error::Effective boolean inputs are malformed"
+              exit 1
+              ;;
+          esac
+
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch)
+              # Typed dispatch inputs retain their existing behavior.
+              ;;
+            push)
+              if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+                echo "::error::The temporary push trigger cannot be re-run"
+                exit 1
+              fi
+              if [ "${EXPECTED_WRITER_RUN_ID}:${MAX_DEALS}:${DETERMINISTIC_ONLY}:${INCLUDE_CATEGORY_PRESENT}" != \
+                   "32509765967:0:false:false" ]; then
+                echo "::error::The temporary push trigger has unexpected effective inputs"
+                exit 1
+              fi
+              before="$({ python - "${GITHUB_EVENT_PATH}" "${GITHUB_SHA}" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          event = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_after = sys.argv[2]
+          before = event.get("before")
+          after = event.get("after")
+          if event.get("ref") != "refs/heads/main":
+              raise SystemExit("Push payload is not for main")
+          if event.get("deleted") is not False or event.get("forced") is not False:
+              raise SystemExit("Deleted or forced pushes are not authorized")
+          if "inputs" in event:
+              raise SystemExit("Push payload unexpectedly contains dispatch inputs")
+          if not isinstance(before, str) or not re.fullmatch(r"[0-9a-f]{40}", before):
+              raise SystemExit("Push payload has a malformed before SHA")
+          if before == "0" * 40:
+              raise SystemExit("Branch-creation pushes are not authorized")
+          if after != expected_after:
+              raise SystemExit("Push payload after SHA does not match GITHUB_SHA")
+          print(before)
+          PY
+              } 2>&1)" || {
+                echo "::error::Push payload failed the one-shot safety gate"
+                exit 1
+              }
+              if ! git cat-file -e "${before}^{commit}" 2>/dev/null || \
+                 ! git merge-base --is-ancestor "${before}" "${GITHUB_SHA}"; then
+                echo "::error::Push predecessor is unavailable or not an ancestor"
+                exit 1
+              fi
+              if git cat-file -e "${before}:${ONE_SHOT_MARKER_PATH}" 2>/dev/null; then
+                echo "::error::One-shot marker already existed before this push"
+                exit 1
+              fi
+              marker_change="$(git diff --name-status --no-renames \
+                "${before}" "${GITHUB_SHA}" -- "${ONE_SHOT_MARKER_PATH}")"
+              if [ "${marker_change}" != $'A\t'"${ONE_SHOT_MARKER_PATH}" ]; then
+                echo "::error::One-shot marker was not newly added by this push"
+                exit 1
+              fi
+              if [ ! -f "${ONE_SHOT_MARKER_PATH}" ] || [ -L "${ONE_SHOT_MARKER_PATH}" ]; then
+                echo "::error::One-shot marker is missing or not a regular file"
+                exit 1
+              fi
+              marker_sha256="$(sha256sum -- "${ONE_SHOT_MARKER_PATH}" | cut -d' ' -f1)"
+              if [ "${marker_sha256}" != "${ONE_SHOT_MARKER_SHA256}" ]; then
+                echo "::error::One-shot marker content does not match the authorized payload"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported workflow event"
+              exit 1
+              ;;
+          esac
+
       - name: Require main dispatch and terminal current writer plan
         env:
-          EXPECTED_WRITER_RUN_ID: ${{ inputs.writer_run_id }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -113,8 +229,6 @@ jobs:
 
       - name: Validate inputs and required secrets
         env:
-          MAX_DEALS: ${{ inputs.max_deals }}
-          DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         shell: bash
@@ -170,11 +284,8 @@ jobs:
 
       - name: Fresh read-only activity preparation
         env:
-          MAX_DEALS: ${{ inputs.max_deals }}
-          DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
-          INCLUDE_CATEGORY_PRESENT: ${{ inputs.include_category_present }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
-          OPENAI_API_KEY: ${{ !inputs.deterministic_only && secrets.OPENAI_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ (github.event_name == 'push' || !inputs.deterministic_only) && secrets.OPENAI_API_KEY || '' }}
         shell: bash
         run: |
           set -Eeuo pipefail
