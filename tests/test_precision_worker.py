@@ -8,14 +8,22 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from classifier.precision_plan import (
     FORBIDDEN_CATEGORY_IDS,
     PLAN_FORMAT,
     PLAN_FORMAT_V2,
     PLAN_FORMAT_V3,
+    PLAN_FORMAT_V4,
     PLAN_VERSION,
     ApprovedPlan,
+    PlanEntry,
+    activity_index_guard_fingerprint,
+    activity_locator_fingerprint,
+    canonical_activity_evidence,
+    canonical_activity_index,
+    canonical_activity_index_value,
     canonical_deal_text_evidence,
     canonical_product_evidence,
     category_desired_fingerprint,
@@ -29,9 +37,12 @@ from classifier.precision_plan import (
     transition_fingerprint,
 )
 from classifier.precision_worker import (
+    ACTIVITY_PAGE_SIZE,
+    ActivityEvidenceUnavailable,
     CATEGORY_FIELD,
     SUBCATEGORY_FIELD,
     EXCLUDED_STAGE_NAMES,
+    MAX_ACTIVITY_DISCOVERY_PAGES,
     MAX_UNCONFIRMED_ATTEMPTS,
     PermanentWorkerError,
     PrecisionWorker,
@@ -46,6 +57,10 @@ from classifier.precision_worker import (
     retry_delay,
     single_instance,
 )
+from tools.generate_precision_plan_assets import (
+    _has_private_activity_text,
+    _private_activity_texts,
+)
 
 
 TEST_WEBHOOK = "https://example.bitrix24.test/rest/1/test-token/"
@@ -57,22 +72,24 @@ def approved_plan(rows):
     transitions = set()
     desired_modes = {}
     subcategory_guards = {}
+    activity_index_guards = {}
+    activity_locators = {}
+    plan_entries = {}
     for row in rows:
         deal_id, original, desired = row[:3]
         evidence_mode = row[3] if len(row) > 3 else "fields"
         evidence = row[4] if len(row) > 4 else ""
-        transitions.add(
-            transition_fingerprint(
-                TEST_KEY,
-                deal_id,
-                original[0],
-                original[1],
-                desired[0],
-                desired[1],
-                evidence_mode,
-                evidence,
-            )
+        transition = transition_fingerprint(
+            TEST_KEY,
+            deal_id,
+            original[0],
+            original[1],
+            desired[0],
+            desired[1],
+            evidence_mode,
+            evidence,
         )
+        transitions.add(transition)
         if evidence_mode.startswith("category_"):
             target = category_desired_fingerprint(TEST_KEY, deal_id, desired[0])
             subcategory_guards[target] = subcategory_guard_fingerprint(
@@ -83,7 +100,19 @@ def approved_plan(rows):
         else:
             target = desired_fingerprint(TEST_KEY, deal_id, desired[0], desired[1])
             subcategory_guards[target] = "-"
+        index_guard = row[5] if len(row) > 5 else "-"
+        locators = tuple(row[6]) if len(row) > 6 else ()
         desired_modes[target] = evidence_mode
+        activity_index_guards[target] = index_guard
+        activity_locators[target] = locators
+        plan_entries[target] = PlanEntry(
+            transition=transition,
+            target=target,
+            evidence_mode=evidence_mode,
+            subcategory_guard=subcategory_guards[target],
+            activity_index_guard=index_guard,
+            activity_locators=locators,
+        )
     return ApprovedPlan(
         2025,
         len(rows),
@@ -92,6 +121,9 @@ def approved_plan(rows):
         "digest",
         TEST_KEY,
         subcategory_guards,
+        activity_index_guards,
+        activity_locators,
+        plan_entries,
     )
 
 
@@ -103,6 +135,8 @@ def signed_allowlist(
     version=PLAN_VERSION,
     evidence_mode="fields",
     evidence="",
+    activity_index_guard="-",
+    activity_locators=(),
 ):
     transition = transition_fingerprint(
         TEST_KEY, deal_id, "old", "broad", "1821", "2071", evidence_mode, evidence
@@ -114,11 +148,18 @@ def signed_allowlist(
         else desired_fingerprint(TEST_KEY, deal_id, "1821", "2071")
     )
     columns = [transition, desired, evidence_mode]
-    if (plan_format, version) == (PLAN_FORMAT, PLAN_VERSION):
+    if (plan_format, version) in ((PLAN_FORMAT_V4, 4), (PLAN_FORMAT, PLAN_VERSION)):
         columns.append(
             subcategory_guard_fingerprint(TEST_KEY, deal_id, "broad")
             if category_only
             else "-"
+        )
+    if (plan_format, version) == (PLAN_FORMAT, PLAN_VERSION):
+        columns.extend(
+            [
+                activity_index_guard,
+                ",".join(activity_locators) if activity_locators else "-",
+            ]
         )
     content_lines = ["\t".join(columns)]
     header = {
@@ -198,6 +239,234 @@ def enqueue(
     )
     state.commit()
     return state.db.execute("SELECT * FROM queue WHERE deal_id=?", (deal_id,)).fetchone()
+
+
+def activity_row(
+    activity_id=501,
+    *,
+    deal_id=42,
+    kind="email",
+    subject="Запрос на тельфер",
+    description="<p>Нужен тельфер 2 т</p>\r\n",
+    transcription="",
+    owner_type_id="3",
+    owner_id="77",
+):
+    activity_type = "4" if kind == "email" else "2"
+    direction = "1" if kind == "email" else "2"
+    row = {
+        "ID": str(activity_id),
+        "OWNER_TYPE_ID": owner_type_id,
+        "OWNER_ID": owner_id,
+        "TYPE_ID": activity_type,
+        "DIRECTION": direction,
+        "PROVIDER_ID": "IMOPENLINES" if kind == "call" else "CRM_EMAIL",
+        "PROVIDER_TYPE_ID": "CALL" if kind == "call" else "EMAIL",
+        "SUBJECT": subject,
+        "DESCRIPTION": description,
+        "DESCRIPTION_TYPE": "3",
+        "CREATED": "2025-04-01T10:00:00+03:00",
+        "LAST_UPDATED": "2025-04-01T10:01:00+03:00",
+        "START_TIME": "2025-04-01T10:00:00+03:00",
+        "END_TIME": "2025-04-01T10:01:00+03:00",
+        "COMPLETED": "Y",
+        "BINDINGS": [
+            {"OWNER_TYPE_ID": "3", "OWNER_ID": "77"},
+            {"OWNER_TYPE_ID": "2", "OWNER_ID": str(deal_id)},
+        ],
+    }
+    if kind == "call":
+        row["transcription"] = transcription or "Клиенту нужен тельфер 2 т"
+    return row
+
+
+def activity_plan(
+    index_rows,
+    selected_rows,
+    *,
+    deal_id=1,
+    original=("cat-old", "sub-old"),
+    desired=("cat-new", "sub-new"),
+    category_only=False,
+):
+    mode = "category_activities" if category_only else "activities"
+    index = canonical_activity_index(deal_id, index_rows)
+    evidence = canonical_activity_evidence(deal_id, index_rows, selected_rows)
+    guard = activity_index_guard_fingerprint(TEST_KEY, deal_id, index)
+    locators = sorted(
+        activity_locator_fingerprint(
+            TEST_KEY,
+            deal_id,
+            "email" if str(row["TYPE_ID"]) == "4" else "call",
+            row["ID"],
+        )
+        for row in selected_rows
+    )
+    return approved_plan(
+        [
+            (
+                deal_id,
+                original,
+                desired,
+                mode,
+                evidence,
+                guard,
+                locators,
+            )
+        ]
+    )
+
+
+class ActivityRuntimeBitrix:
+    def __init__(
+        self,
+        *,
+        live,
+        activity_indexes,
+        details,
+        transcripts=None,
+        detail_errors=None,
+    ):
+        self.live = dict(live)
+        self.activity_indexes = list(activity_indexes)
+        self.details = {str(key): value for key, value in details.items()}
+        self.transcripts = {str(key): value for key, value in (transcripts or {}).items()}
+        self.detail_errors = detail_errors or {}
+        self.calls = []
+        self.activity_list_count = 0
+        self.update_commands = []
+        self.bindings = {}
+        index_rows = [
+            item for page in self.activity_indexes for item in page
+        ]
+        for row in [*self.details.values(), *index_rows]:
+            if isinstance(row, dict) and row.get("ID") is not None:
+                self._remember_bindings(row)
+
+    def _remember_bindings(self, row):
+        values = row.get("BINDINGS", row.get("bindings", []))
+        if not isinstance(values, list):
+            return
+        converted = []
+        for binding in values:
+            if not isinstance(binding, dict):
+                continue
+            entity_type = binding.get(
+                "entityTypeId",
+                binding.get("OWNER_TYPE_ID", binding.get("ownerTypeId")),
+            )
+            entity_id = binding.get(
+                "entityId",
+                binding.get("OWNER_ID", binding.get("ownerId")),
+            )
+            if entity_type is not None and entity_id is not None:
+                converted.append(
+                    {"entityTypeId": int(entity_type), "entityId": int(entity_id)}
+                )
+        self.bindings[str(row["ID"])] = converted
+
+    def _activity_page(self, version, last_id):
+        for row in version:
+            self._remember_bindings(row)
+        return [
+            {key: value for key, value in row.items() if key != "BINDINGS"}
+            for row in version
+            if int(row["ID"]) > last_id
+        ][:50]
+
+    def _deal_rows(self, deal_ids):
+        rows = []
+        for deal_id in sorted(deal_ids):
+            live = self.live.get(deal_id)
+            if live is None:
+                continue
+            rows.append(
+                {
+                    "ID": str(deal_id),
+                    CATEGORY_FIELD: live[0],
+                    SUBCATEGORY_FIELD: live[1],
+                    "STAGE_ID": live[2],
+                    "TITLE": live[3] if len(live) > 3 else "",
+                    "COMMENTS": live[4] if len(live) > 4 else "",
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _command_id(command):
+        values = parse_qs(urlsplit(command).query)
+        return str((values.get("id") or values.get("activityId") or [""])[0])
+
+    def call(self, method, params=None):
+        params = params or {}
+        self.calls.append((method, params))
+        if method == "crm.deal.list":
+            return self._deal_rows({int(value) for value in params["filter"]["@ID"]})
+        if method == "crm.activity.list":
+            version = self.activity_indexes[
+                min(self.activity_list_count, len(self.activity_indexes) - 1)
+            ]
+            self.activity_list_count += 1
+            last_id = int(params["filter"][">ID"])
+            return self._activity_page(version, last_id)
+        if method == "crm.activity.binding.list":
+            activity_id = str(params["activityId"])
+            start = int(params["start"])
+            return self.bindings.get(activity_id, [])[start:start + 50]
+        if method == "crm.activity.call.getTranscript":
+            return self.transcripts.get(str(params["activityId"]))
+        if method == "batch":
+            results = {}
+            errors = {}
+            for name, command in params["cmd"].items():
+                if command.startswith("crm.activity.list?"):
+                    values = parse_qs(urlsplit(command).query)
+                    version = self.activity_indexes[
+                        min(self.activity_list_count, len(self.activity_indexes) - 1)
+                    ]
+                    self.activity_list_count += 1
+                    last_id = int(values["filter[>ID]"][0])
+                    results[name] = self._activity_page(version, last_id)
+                elif command.startswith("crm.activity.binding.list?"):
+                    activity_id = self._command_id(command)
+                    start = int(
+                        parse_qs(urlsplit(command).query).get("start", ["0"])[0]
+                    )
+                    results[name] = self.bindings.get(activity_id, [])[
+                        start:start + 50
+                    ]
+                elif command.startswith("crm.activity.get?"):
+                    activity_id = self._command_id(command)
+                    if activity_id in self.detail_errors:
+                        errors[name] = self.detail_errors[activity_id]
+                    elif activity_id in self.details:
+                        results[name] = self.details[activity_id]
+                    else:
+                        errors[name] = {"error": "NOT_FOUND"}
+                elif command.startswith("crm.activity.call.getTranscript?"):
+                    activity_id = self._command_id(command)
+                    results[name] = self.transcripts.get(activity_id)
+                elif command.startswith("crm.deal.update?"):
+                    self.update_commands.append(command)
+                    values = parse_qs(urlsplit(command).query)
+                    deal_id = int(values["id"][0])
+                    old = self.live[deal_id]
+                    category = values[f"fields[{CATEGORY_FIELD}]"][0]
+                    subcategory = (
+                        values.get(f"fields[{SUBCATEGORY_FIELD}]", [old[1]])[0]
+                    )
+                    self.live[deal_id] = (
+                        category,
+                        subcategory,
+                        old[2],
+                        old[3] if len(old) > 3 else "",
+                        old[4] if len(old) > 4 else "",
+                    )
+                    results[name] = True
+                else:
+                    raise AssertionError(f"Unexpected batch command: {command}")
+            return {"result": results, "result_error": errors}
+        raise AssertionError(f"Unexpected Bitrix method: {method}")
 
 
 class PrecisionWorkerTests(unittest.TestCase):
@@ -287,6 +556,141 @@ class PrecisionWorkerTests(unittest.TestCase):
             canonical_deal_text_evidence("a", "bc"),
         )
 
+    def test_activity_canonicalization_is_exact_stable_and_deal_bound(self):
+        email = activity_row(502)
+        call = activity_row(501, kind="call")
+        index_a = canonical_activity_index(42, [email, call])
+        index_b = canonical_activity_index(42, [call, email])
+        self.assertEqual(index_a, index_b)
+        evidence = canonical_activity_evidence(42, [email, call], [email, call])
+        for field, value in (
+            ("SUBJECT", "Запрос на тельфер "),
+            ("DESCRIPTION", "<p>Нужен тельфер 2 т</p>\n"),
+            ("PROVIDER_ID", "CHANGED"),
+        ):
+            changed = [dict(email), dict(call)]
+            changed[0][field] = value
+            self.assertNotEqual(
+                evidence,
+                canonical_activity_evidence(42, changed, [changed[0], changed[1]]),
+            )
+        changed_call = dict(call)
+        changed_call["transcription"] += " "
+        self.assertNotEqual(
+            evidence,
+            canonical_activity_evidence(42, [email, call], [email, changed_call]),
+        )
+        self.assertNotEqual(
+            activity_locator_fingerprint(TEST_KEY, 42, "email", 502),
+            activity_locator_fingerprint(TEST_KEY, 43, "email", 502),
+        )
+
+    def test_activity_scope_requires_deal_binding_and_supported_direction(self):
+        binding_only = activity_row(owner_type_id="3", owner_id="77")
+        value = canonical_activity_index_value(42, [binding_only])
+        self.assertEqual(value[2][0][1:3], ["3", "77"])
+        missing_binding = dict(binding_only)
+        missing_binding["BINDINGS"] = [{"OWNER_TYPE_ID": "3", "OWNER_ID": "77"}]
+        with self.assertRaisesRegex(ValueError, "scope"):
+            canonical_activity_index_value(42, [missing_binding])
+        outgoing_email = dict(binding_only)
+        outgoing_email["DIRECTION"] = "2"
+        with self.assertRaisesRegex(ValueError, "scope"):
+            canonical_activity_index_value(42, [outgoing_email])
+        call_snapshot = activity_row(501, kind="call")
+        with self.assertRaisesRegex(ValueError, "index"):
+            canonical_activity_evidence(42, [binding_only], [call_snapshot])
+        whitespace_call = activity_row(502, kind="call", transcription=" \r\n ")
+        with self.assertRaisesRegex(ValueError, "расшифровки"):
+            canonical_activity_evidence(42, [whitespace_call], [whitespace_call])
+        explicit_empty = dict(binding_only)
+        explicit_empty["LAST_UPDATED"] = None
+        canonical_activity_index_value(42, [explicit_empty])
+        missing_metadata = dict(explicit_empty)
+        missing_metadata.pop("LAST_UPDATED")
+        with self.assertRaisesRegex(ValueError, "обязательные поля"):
+            canonical_activity_index_value(42, [missing_metadata])
+        provider_none = dict(binding_only)
+        provider_none["PROVIDER_ID"] = None
+        provider_false = dict(binding_only)
+        provider_false["PROVIDER_ID"] = False
+        self.assertNotEqual(
+            canonical_activity_index(42, [provider_none]),
+            canonical_activity_index(42, [provider_false]),
+        )
+        subject_none = dict(binding_only)
+        subject_none["SUBJECT"] = None
+        subject_false = dict(binding_only)
+        subject_false["SUBJECT"] = False
+        self.assertEqual(
+            canonical_activity_index(42, [subject_none]),
+            canonical_activity_index(42, [subject_false]),
+        )
+
+    def test_v5_activity_rows_require_strict_guards_and_sorted_locators(self):
+        email = activity_row()
+        index = canonical_activity_index(42, [email])
+        guard = activity_index_guard_fingerprint(TEST_KEY, 42, index)
+        locator = activity_locator_fingerprint(TEST_KEY, 42, "email", 501)
+        other_locator = activity_locator_fingerprint(TEST_KEY, 42, "email", 502)
+        evidence = canonical_activity_evidence(42, [email], [email])
+        header, lines = signed_allowlist(
+            evidence_mode="activities",
+            evidence=evidence,
+            activity_index_guard=guard,
+            activity_locators=(locator,),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.allowlist"
+
+            def load_line(columns):
+                content = ["\t".join(columns)]
+                signed = dict(header)
+                signed.pop("manifest_mac", None)
+                signed["entries_digest"] = entries_digest(content)
+                signed["manifest_mac"] = manifest_mac(TEST_KEY, signed)
+                path.write_text(json.dumps(signed) + "\n" + content[0] + "\n")
+                return ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
+
+            loaded = load_line(lines[0].split("\t"))
+            entry = loaded.entry_for_target(42, ("1821", "2071"), "activities")
+            self.assertEqual(entry.activity_index_guard, guard)
+            self.assertEqual(entry.activity_locators, (locator,))
+            columns = lines[0].split("\t")
+            malformed = (
+                columns[:4] + ["-", locator],
+                columns[:4] + [guard, "-"],
+                columns[:4] + [guard, f"{locator},{locator}"],
+                columns[:4] + [guard, ",".join(sorted((locator, other_locator), reverse=True))],
+                columns[:4] + [guard, "g" * 32],
+                columns[:4] + [guard, ",".join([locator] * 9)],
+            )
+            for bad in malformed:
+                with self.subTest(columns=bad[4:]):
+                    with self.assertRaises(ValueError):
+                        load_line(bad)
+
+            non_activity = signed_allowlist()[1][0].split("\t")
+            non_activity[4:] = [guard, locator]
+            with self.assertRaisesRegex(ValueError, "activity поля"):
+                load_line(non_activity)
+
+            category_header, category_lines = signed_allowlist(
+                evidence_mode="category_activities",
+                evidence=evidence,
+                activity_index_guard=guard,
+                activity_locators=(locator,),
+            )
+            header = category_header
+            category_loaded = load_line(category_lines[0].split("\t"))
+            category_entry = category_loaded.entry_for_target(
+                42,
+                ("1821", "broad"),
+                "category_activities",
+            )
+            self.assertIsNotNone(category_entry)
+            self.assertRegex(category_entry.subcategory_guard, r"^[0-9a-f]{32}$")
+
     def test_plan_recovers_only_approved_target_and_transition(self):
         plan = approved_plan([(42, ("old", "broad"), ("1821", "2071"))])
         pairs = (("1821", "2071"), ("1823", "2285"))
@@ -327,7 +731,7 @@ class PrecisionWorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Подпись заголовка"):
                 ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
 
-    def test_allowlist_loader_supports_v2_v3_v4_with_protocol_gated_modes(self):
+    def test_allowlist_loader_supports_v2_through_v5_with_protocol_gated_modes(self):
         evidence = canonical_deal_text_evidence("Заголовок", "Комментарий")
         cases = [
             signed_allowlist(plan_format=PLAN_FORMAT_V2, version=2),
@@ -337,8 +741,18 @@ class PrecisionWorkerTests(unittest.TestCase):
                 evidence_mode="deal_text",
                 evidence=evidence,
             ),
+            signed_allowlist(
+                plan_format=PLAN_FORMAT_V4,
+                version=4,
+                evidence_mode="deal_text",
+                evidence=evidence,
+            ),
+            signed_allowlist(
+                plan_format=PLAN_FORMAT_V4,
+                version=4,
+                evidence_mode="category_fields",
+            ),
             signed_allowlist(evidence_mode="deal_text", evidence=evidence),
-            signed_allowlist(evidence_mode="category_fields"),
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plan.allowlist"
@@ -375,7 +789,7 @@ class PrecisionWorkerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Неподдерживаемый формат"):
                     ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
 
-    def test_allowlist_loader_enforces_protocol_columns_and_v4_guard_shape(self):
+    def test_allowlist_loader_enforces_protocol_columns_and_guard_shapes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plan.allowlist"
 
@@ -410,7 +824,10 @@ class PrecisionWorkerTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "Некорректная строка"):
                         ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
 
-            full_header, full_lines = signed_allowlist()
+            full_header, full_lines = signed_allowlist(
+                plan_format=PLAN_FORMAT_V4,
+                version=4,
+            )
             write_signed(full_header, full_lines)
             loaded = ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
             self.assertEqual(set(loaded.subcategory_guards.values()), {"-"})
@@ -428,7 +845,9 @@ class PrecisionWorkerTests(unittest.TestCase):
                 ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
 
             category_header, category_lines = signed_allowlist(
-                evidence_mode="category_fields"
+                plan_format=PLAN_FORMAT_V4,
+                version=4,
+                evidence_mode="category_fields",
             )
             write_signed(category_header, category_lines)
             category_loaded = ApprovedPlan.load(
@@ -514,7 +933,7 @@ class PrecisionWorkerTests(unittest.TestCase):
             self.assertEqual(json.loads(header)["format"], PLAN_FORMAT)
             self.assertRegex(
                 line,
-                r"^[0-9a-f]{32}\t[0-9a-f]{32}\tdeal_text\t-$",
+                r"^[0-9a-f]{32}\t[0-9a-f]{32}\tdeal_text\t-\t-\t-$",
             )
 
             private_plan.write_text(
@@ -529,6 +948,102 @@ class PrecisionWorkerTests(unittest.TestCase):
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("нет комментария", rejected.stderr)
+
+    def test_generator_recomputes_v5_activity_guards_without_leaking_raw_evidence(self):
+        email = activity_row(
+            987654321,
+            subject="SENTINEL-ACTIVITY-SUBJECT-19f3",
+            description="SENTINEL-ACTIVITY-BODY-a08d\r\n",
+        )
+        index_row = dict(email)
+        index_row.pop("DESCRIPTION")
+        get_row = dict(email)
+        get_row.pop("BINDINGS")
+        row = {
+            "deal_id": 42,
+            "current_category_id": "old",
+            "current_subcategory_id": "broad",
+            "category_id": "1821",
+            "subcategory_id": "2071",
+            "category": "Грузоподъёмное оборудование",
+            "subcategory": "Тельферы электрические канатные",
+            "reason": "activities",
+            "activity_index": [index_row],
+            "selected_activities": [get_row],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_plan = root / "private.json"
+            products = root / "products.json"
+            allowlist = root / "public.allowlist"
+            taxonomy = root / "taxonomy.json"
+            private_plan.write_text(json.dumps([row], ensure_ascii=False))
+            private_plan.chmod(0o600)
+            products.write_text("{}")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "tools/generate_precision_plan_assets.py",
+                    "--plan", str(private_plan),
+                    "--allowlist", str(allowlist),
+                    "--taxonomy", str(taxonomy),
+                    "--products", str(products),
+                    "--year", "2025",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env={
+                    **os.environ,
+                    "BITRIX_WEBHOOK_URL": TEST_WEBHOOK,
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                },
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            public = allowlist.read_text() + taxonomy.read_text() + result.stdout + result.stderr
+            self.assertNotIn(email["SUBJECT"], public)
+            self.assertNotIn(email["DESCRIPTION"], public)
+            self.assertNotIn(email["ID"], public)
+            columns = allowlist.read_text().splitlines()[1].split("\t")
+            self.assertEqual(len(columns), 6)
+            self.assertEqual(columns[2:4], ["activities", "-"])
+            self.assertRegex(columns[4], r"^[0-9a-f]{32}$")
+            self.assertRegex(columns[5], r"^[0-9a-f]{32}$")
+            loaded = ApprovedPlan.load(allowlist, TEST_KEY, 2025, TEST_PORTAL)
+            entry = loaded.entry_for_target(42, ("1821", "2071"), "activities")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.activity_index_guard, columns[4])
+            self.assertEqual(entry.activity_locators, (columns[5],))
+
+            short_index = activity_row(987654322, subject="S7")
+            positional_index = canonical_activity_index_value(42, [short_index])
+            self.assertIn("S7", _private_activity_texts(positional_index))
+            self.assertFalse(
+                _has_private_activity_text(
+                    {"1", "a", "-", "S7", "year", "count", "format"},
+                    allowlist.read_text(),
+                    taxonomy.read_text(),
+                    result.stdout,
+                )
+            )
+            self.assertTrue(
+                _has_private_activity_text(
+                    {"S7"},
+                    allowlist.read_text().rstrip("\n") + "\tS7\n",
+                    taxonomy.read_text(),
+                    result.stdout,
+                )
+            )
+            leaked_taxonomy = json.loads(taxonomy.read_text())
+            leaked_taxonomy["categories"]["1821"] = "S7"
+            self.assertTrue(
+                _has_private_activity_text(
+                    {"S7"},
+                    allowlist.read_text(),
+                    json.dumps(leaked_taxonomy, ensure_ascii=False),
+                    result.stdout,
+                )
+            )
 
     def test_state_persists_and_rejects_other_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1601,15 +2116,29 @@ class PrecisionWorkerTests(unittest.TestCase):
             finally:
                 state.close()
 
-    def test_v4_wire_protocol_is_not_accepted_by_the_v3_worker_gate(self):
+    def test_v5_wire_protocol_is_not_accepted_by_the_v4_worker_gate(self):
         header, _ = signed_allowlist(evidence_mode="category_fields")
         protocol = (str(header["format"]), int(header["version"]))
-        legacy_v3_protocols = {
+        legacy_v4_protocols = {
             (PLAN_FORMAT_V2, 2),
             (PLAN_FORMAT_V3, 3),
+            (PLAN_FORMAT_V4, 4),
         }
         self.assertEqual(protocol, (PLAN_FORMAT, PLAN_VERSION))
-        self.assertNotIn(protocol, legacy_v3_protocols)
+        self.assertNotIn(protocol, legacy_v4_protocols)
+
+        old_header, old_lines = signed_allowlist(
+            plan_format=PLAN_FORMAT_V4,
+            version=4,
+            evidence_mode="activities",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old.allowlist"
+            path.write_text(
+                json.dumps(old_header) + "\n" + "\n".join(old_lines) + "\n"
+            )
+            with self.assertRaisesRegex(ValueError, "Некорректный источник"):
+                ApprovedPlan.load(path, TEST_KEY, 2025, TEST_PORTAL)
 
     def test_category_only_target_resolution_reports_exact_subcategory_guard(self):
         for deal_id, subcategory in ((41, ""), (42, "legacy-subcategory-991")):
@@ -2018,13 +2547,14 @@ class PrecisionWorkerTests(unittest.TestCase):
             self.assertNotIn(private_subcategory, allowlist_path.read_text())
             lines = allowlist_path.read_text().splitlines()
             by_mode = {line.split("\t")[2]: line.split("\t") for line in lines[1:]}
-            self.assertEqual(len(by_mode["fields"]), 4)
+            self.assertEqual(len(by_mode["fields"]), 6)
             self.assertEqual(by_mode["fields"][3], "-")
+            self.assertEqual(by_mode["fields"][4:], ["-", "-"])
             self.assertEqual(
                 by_mode["fields"][1],
                 desired_fingerprint(TEST_KEY, 201, "1821", "2071"),
             )
-            self.assertEqual(len(by_mode["category_fields"]), 4)
+            self.assertEqual(len(by_mode["category_fields"]), 6)
             self.assertEqual(
                 by_mode["category_fields"][1],
                 category_desired_fingerprint(TEST_KEY, 202, "1823"),
@@ -2037,6 +2567,7 @@ class PrecisionWorkerTests(unittest.TestCase):
                     private_subcategory,
                 ),
             )
+            self.assertEqual(by_mode["category_fields"][4:], ["-", "-"])
 
             loaded = ApprovedPlan.load(
                 allowlist_path,
@@ -2268,6 +2799,1132 @@ class PrecisionWorkerTests(unittest.TestCase):
             write({"6901": "Новая или запрещённая категория"})
             with self.assertRaisesRegex(PermanentWorkerError, "запрещённые категории"):
                 load_taxonomy(path, 2025, require_pairs=False)
+
+    def test_activity_scan_defers_evidence_and_skips_terminal_rows(self):
+        records = []
+        for deal_id, category_only in (
+            (1, False),
+            (2, False),
+            (3, True),
+            (4, False),
+        ):
+            selected = activity_row(500 + deal_id, deal_id=deal_id)
+            original = ("cat-old", "signed-sub")
+            desired = (
+                ("cat-new", "signed-sub")
+                if category_only
+                else ("cat-new", "sub-new")
+            )
+            mode = "category_activities" if category_only else "activities"
+            evidence = canonical_activity_evidence(deal_id, [selected], [selected])
+            records.append(
+                (
+                    deal_id,
+                    original,
+                    desired,
+                    mode,
+                    evidence,
+                    activity_index_guard_fingerprint(
+                        TEST_KEY,
+                        deal_id,
+                        canonical_activity_index(deal_id, [selected]),
+                    ),
+                    [
+                        activity_locator_fingerprint(
+                            TEST_KEY, deal_id, "email", selected["ID"]
+                        )
+                    ],
+                )
+            )
+        plan = approved_plan(records)
+
+        class ScanBitrix:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+                if method != "crm.deal.list":
+                    raise AssertionError("activity APIs must not run during scan")
+                return [
+                    {
+                        "ID": "1",
+                        CATEGORY_FIELD: "cat-old",
+                        SUBCATEGORY_FIELD: "signed-sub",
+                        "STAGE_ID": "DUP",
+                        "TITLE": "",
+                    },
+                    {
+                        "ID": "2",
+                        CATEGORY_FIELD: "cat-new",
+                        SUBCATEGORY_FIELD: "sub-new",
+                        "STAGE_ID": "NEW",
+                        "TITLE": "",
+                    },
+                    {
+                        "ID": "3",
+                        CATEGORY_FIELD: "cat-old",
+                        SUBCATEGORY_FIELD: "manually-changed",
+                        "STAGE_ID": "NEW",
+                        "TITLE": "",
+                    },
+                    {
+                        "ID": "4",
+                        CATEGORY_FIELD: "cat-old",
+                        SUBCATEGORY_FIELD: "signed-sub",
+                        "STAGE_ID": "NEW",
+                        "TITLE": "",
+                    },
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                bitrix = ScanBitrix()
+                worker = make_worker(
+                    state,
+                    bitrix,
+                    directory,
+                    plan=plan,
+                    pairs=(("cat-new", "sub-new"),),
+                )
+                worker.allowed_category_ids = ("cat-new",)
+                worker.excluded_stage_ids = {"DUP"}
+                worker.scan_deals()
+                self.assertEqual(
+                    state.counts(),
+                    {
+                        "excluded_stage": 1,
+                        "verified": 1,
+                        "conflict": 1,
+                        "pending": 1,
+                    },
+                )
+                self.assertFalse(
+                    any(method.startswith("crm.activity") for method, _ in bitrix.calls)
+                )
+            finally:
+                state.close()
+
+    def test_activity_discovery_uses_binding_keyset_without_offsets(self):
+        rows = [activity_row(index, deal_id=1) for index in range(1, 101)]
+
+        class KeysetBitrix:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+                if method == "batch":
+                    results = {}
+                    for name, command in params["cmd"].items():
+                        if command.startswith("crm.activity.binding.list?"):
+                            values = parse_qs(urlsplit(command).query)
+                            activity_id = values["activityId"][0]
+                            start = int(values["start"][0])
+                            row = next(
+                                item for item in rows
+                                if item["ID"] == activity_id
+                            )
+                            results[name] = [
+                                {
+                                    "entityTypeId": int(binding["OWNER_TYPE_ID"]),
+                                    "entityId": int(binding["OWNER_ID"]),
+                                }
+                                for binding in row["BINDINGS"]
+                            ][start:start + 50]
+                            continue
+                        values = parse_qs(urlsplit(command).query)
+                        if values.get("start") != ["0"]:
+                            raise AssertionError("offset pagination is forbidden")
+                        last_id = int(values["filter[>ID]"][0])
+                        results[name] = [
+                            {
+                                key: value
+                                for key, value in row.items()
+                                if key != "BINDINGS"
+                            }
+                            for row in rows if int(row["ID"]) > last_id
+                        ][:50]
+                    return {"result": results, "result_error": {}}
+                if method == "crm.activity.binding.list":
+                    row = next(
+                        item for item in rows
+                        if item["ID"] == str(params["activityId"])
+                    )
+                    start = int(params["start"])
+                    return [
+                        {
+                            "entityTypeId": int(binding["OWNER_TYPE_ID"]),
+                            "entityId": int(binding["OWNER_ID"]),
+                        }
+                        for binding in row["BINDINGS"]
+                    ][start:start + 50]
+                self.assert_params(params)
+                last_id = int(params["filter"][">ID"])
+                return [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "BINDINGS"
+                    }
+                    for row in rows if int(row["ID"]) > last_id
+                ][:50]
+
+            @staticmethod
+            def assert_params(params):
+                if params.get("start") != 0:
+                    raise AssertionError("offset pagination is forbidden")
+                if params.get("order") != {"ID": "ASC"}:
+                    raise AssertionError("activity order must be ID ASC")
+                if params["filter"]["BINDINGS"] != [
+                    {"OWNER_TYPE_ID": 2, "OWNER_ID": 1}
+                ]:
+                    raise AssertionError("deal binding filter is required")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                bitrix = KeysetBitrix()
+                worker = make_worker(state, bitrix, directory)
+                found = worker.list_relevant_activities(1)
+                self.assertEqual([int(row["ID"]) for row in found], list(range(1, 101)))
+                self.assertEqual(
+                    [
+                        call[1]["filter"][">ID"]
+                        for call in bitrix.calls
+                        if call[0] == "crm.activity.list"
+                    ],
+                    [0, 50, 100],
+                )
+                self.assertTrue(all(row["OWNER_TYPE_ID"] == "3" for row in found))
+                batched, failures = worker.list_relevant_activities_many([1])
+                self.assertEqual(failures, {})
+                self.assertEqual(
+                    [int(row["ID"]) for row in batched[1]],
+                    list(range(1, 101)),
+                )
+            finally:
+                state.close()
+
+    def test_activity_binding_hydration_reads_all_pages_and_explicit_eof(self):
+        index_row = activity_row(7001, deal_id=1)
+        index_row.pop("BINDINGS")
+        all_bindings = [
+            {"entityTypeId": 2, "entityId": 1},
+            *(
+                {"entityTypeId": 3, "entityId": value}
+                for value in range(1, 100)
+            ),
+        ]
+
+        class PagedBindingBitrix:
+            def __init__(self, *, direct_fallback=False, values=None):
+                self.direct_fallback = direct_fallback
+                self.values = list(values if values is not None else all_bindings)
+                self.batch_starts = []
+                self.direct_starts = []
+
+            def call(self, method, params=None):
+                params = params or {}
+                if method == "batch":
+                    results = {}
+                    errors = {}
+                    for name, command in params["cmd"].items():
+                        parsed = urlsplit(command)
+                        if parsed.path != "crm.activity.binding.list":
+                            raise AssertionError(f"unexpected command: {command}")
+                        values = parse_qs(parsed.query)
+                        start = int(values["start"][0])
+                        self.batch_starts.append(start)
+                        if self.direct_fallback:
+                            errors[name] = {
+                                "error": "ERROR_BATCH_METHOD_NOT_ALLOWED"
+                            }
+                        else:
+                            results[name] = self.values[start:start + 50]
+                    return {
+                        "result": results,
+                        # The live portal returns an empty list on success.
+                        "result_error": errors if errors else [],
+                    }
+                if method == "crm.activity.binding.list":
+                    start = int(params["start"])
+                    self.direct_starts.append(start)
+                    return self.values[start:start + 50]
+                raise AssertionError(f"unexpected method: {method}")
+
+        for direct_fallback in (False, True):
+            with self.subTest(
+                direct_fallback=direct_fallback
+            ), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    bitrix = PagedBindingBitrix(
+                        direct_fallback=direct_fallback
+                    )
+                    worker = make_worker(state, bitrix, directory)
+                    hydrated = worker._hydrate_activity_bindings(1, [index_row])
+                    self.assertEqual(len(hydrated[0]["BINDINGS"]), 100)
+                    self.assertEqual(bitrix.batch_starts, [0, 50, 100])
+                    self.assertEqual(
+                        bitrix.direct_starts,
+                        [0, 50, 100] if direct_fallback else [],
+                    )
+                finally:
+                    state.close()
+
+        invalid_values = (
+            (
+                "overflow",
+                [*all_bindings, {"entityTypeId": 4, "entityId": 999}],
+                ValueError,
+            ),
+            (
+                "cross-page-duplicate",
+                [*all_bindings[:-1], all_bindings[0]],
+                ValueError,
+            ),
+            (
+                "non-positive",
+                [{"entityTypeId": 2, "entityId": 0}],
+                ValueError,
+            ),
+            (
+                "conflicting-alias",
+                [
+                    {
+                        "entityTypeId": 2,
+                        "entityId": 1,
+                        "OWNER_ID": 2,
+                    }
+                ],
+                ValueError,
+            ),
+        )
+        for name, values, expected_error in invalid_values:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    worker = make_worker(
+                        state,
+                        PagedBindingBitrix(values=values),
+                        directory,
+                    )
+                    with self.assertRaises(expected_error):
+                        worker._hydrate_activity_bindings(1, [index_row])
+                finally:
+                    state.close()
+
+    def test_activity_discovery_page_cap_applies_to_direct_and_batch(self):
+        rows = []
+        for activity_id in range(1, MAX_ACTIVITY_DISCOVERY_PAGES * 50 + 1):
+            row = activity_row(activity_id, deal_id=1)
+            row["DIRECTION"] = "2"
+            row.pop("BINDINGS")
+            rows.append(row)
+
+        class EndlessUnsupportedBitrix:
+            def __init__(self):
+                self.direct_calls = 0
+                self.batch_calls = 0
+
+            def call(self, method, params=None):
+                params = params or {}
+                if method == "crm.activity.list":
+                    self.direct_calls += 1
+                    last_id = int(params["filter"][">ID"])
+                    return [row for row in rows if int(row["ID"]) > last_id][
+                        :ACTIVITY_PAGE_SIZE
+                    ]
+                if method == "batch":
+                    self.batch_calls += 1
+                    results = {}
+                    for name, command in params["cmd"].items():
+                        parsed = urlsplit(command)
+                        if parsed.path != "crm.activity.list":
+                            raise AssertionError(f"unexpected command: {command}")
+                        values = parse_qs(parsed.query)
+                        last_id = int(values["filter[>ID]"][0])
+                        results[name] = [
+                            row for row in rows if int(row["ID"]) > last_id
+                        ][:ACTIVITY_PAGE_SIZE]
+                    return {"result": results, "result_error": []}
+                raise AssertionError(f"unexpected method: {method}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                direct_bitrix = EndlessUnsupportedBitrix()
+                direct_worker = make_worker(
+                    state,
+                    direct_bitrix,
+                    directory,
+                )
+                with self.assertRaisesRegex(ValueError, "страниц"):
+                    direct_worker.list_relevant_activities(1)
+                self.assertEqual(
+                    direct_bitrix.direct_calls,
+                    MAX_ACTIVITY_DISCOVERY_PAGES,
+                )
+
+                batch_bitrix = EndlessUnsupportedBitrix()
+                batch_worker = make_worker(
+                    state,
+                    batch_bitrix,
+                    directory,
+                )
+                found, failures = batch_worker.list_relevant_activities_many([1])
+                self.assertEqual(found, {})
+                self.assertIsInstance(failures[1], ValueError)
+                self.assertEqual(
+                    batch_bitrix.batch_calls,
+                    MAX_ACTIVITY_DISCOVERY_PAGES,
+                )
+            finally:
+                state.close()
+
+    def test_activity_get_timeout_splits_batch_before_row_level_failure(self):
+        selected_rows = [
+            activity_row(700 + offset, deal_id=1)
+            for offset in range(4)
+        ]
+
+        class SplittingBitrix(ActivityRuntimeBitrix):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.detail_batch_sizes = []
+
+            def call(self, method, params=None):
+                commands = (params or {}).get("cmd", {})
+                if method == "batch" and commands and all(
+                    command.startswith("crm.activity.get?")
+                    for command in commands.values()
+                ):
+                    self.detail_batch_sizes.append(len(commands))
+                    if len(commands) > 2:
+                        self.calls.append((method, params))
+                        raise TimeoutError("activity detail batch timed out")
+                return super().call(method, params)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                bitrix = SplittingBitrix(
+                    live={},
+                    activity_indexes=[[]],
+                    details={row["ID"]: row for row in selected_rows},
+                )
+                worker = make_worker(state, bitrix, directory)
+                with patch.object(worker, "sleep"):
+                    result = worker.fetch_selected_activity_content(
+                        [("email", row) for row in selected_rows]
+                    )
+                self.assertEqual(bitrix.detail_batch_sizes, [4, 2, 2])
+                self.assertEqual(
+                    [row["ID"] for row in result or []],
+                    [row["ID"] for row in selected_rows],
+                )
+            finally:
+                state.close()
+
+    def test_activity_get_result_error_splits_to_singletons(self):
+        selected_rows = [
+            activity_row(800 + offset, deal_id=1)
+            for offset in range(4)
+        ]
+
+        class PerCommandTimeoutBitrix(ActivityRuntimeBitrix):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.detail_batch_sizes = []
+
+            def call(self, method, params=None):
+                commands = (params or {}).get("cmd", {})
+                if method == "batch" and commands and all(
+                    command.startswith("crm.activity.get?")
+                    for command in commands.values()
+                ):
+                    self.detail_batch_sizes.append(len(commands))
+                    if len(commands) > 1:
+                        self.calls.append((method, params))
+                        return {
+                            "result": {},
+                            "result_error": {
+                                name: {"error": "OPERATION_TIME_LIMIT"}
+                                for name in commands
+                            },
+                        }
+                return super().call(method, params)
+
+        class SingletonTimeoutBitrix(PerCommandTimeoutBitrix):
+            def call(self, method, params=None):
+                commands = (params or {}).get("cmd", {})
+                if method == "batch" and len(commands) == 1 and all(
+                    command.startswith("crm.activity.get?")
+                    for command in commands.values()
+                ):
+                    self.detail_batch_sizes.append(1)
+                    self.calls.append((method, params))
+                    return {
+                        "result": {},
+                        "result_error": {
+                            next(iter(commands)): {
+                                "error": "OPERATION_TIME_LIMIT"
+                            }
+                        },
+                    }
+                return super().call(method, params)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                bitrix = PerCommandTimeoutBitrix(
+                    live={},
+                    activity_indexes=[[]],
+                    details={row["ID"]: row for row in selected_rows},
+                )
+                worker = make_worker(state, bitrix, directory)
+                result = worker.fetch_selected_activity_content(
+                    [("email", row) for row in selected_rows]
+                )
+                self.assertEqual(
+                    bitrix.detail_batch_sizes,
+                    [4, 2, 1, 1, 2, 1, 1],
+                )
+                self.assertEqual(len(result or []), 4)
+
+                singleton_bitrix = SingletonTimeoutBitrix(
+                    live={},
+                    activity_indexes=[[]],
+                    details={selected_rows[0]["ID"]: selected_rows[0]},
+                )
+                singleton_worker = make_worker(
+                    state,
+                    singleton_bitrix,
+                    directory,
+                )
+                with self.assertRaises(ActivityEvidenceUnavailable) as raised:
+                    singleton_worker.fetch_selected_activity_content(
+                        [("email", selected_rows[0])]
+                    )
+                self.assertTrue(raised.exception.transient)
+            finally:
+                state.close()
+
+    def test_activity_final_guard_writes_full_pair_and_verifies(self):
+        selected = activity_row(501, deal_id=1)
+        plan = activity_plan([selected], [selected])
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, evidence_mode="activities")
+                bitrix = ActivityRuntimeBitrix(
+                    live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                    activity_indexes=[[selected]],
+                    details={
+                        selected["ID"]: {
+                            key: value
+                            for key, value in selected.items()
+                            if key != "BINDINGS"
+                        }
+                    },
+                )
+                worker = make_worker(state, bitrix, directory, plan=plan)
+                worker.metadata_resolved_at = time.time()
+                with patch.object(worker, "wait_for_write_slot"), patch.object(
+                    worker, "sleep"
+                ):
+                    worker.process_one_batch()
+                self.assertEqual(state.counts(), {"verified": 1})
+                self.assertEqual(bitrix.activity_list_count, 3)
+                self.assertEqual(len(bitrix.update_commands), 1)
+                command = bitrix.update_commands[0]
+                self.assertIn(f"fields%5B{CATEGORY_FIELD}%5D", command)
+                self.assertIn(f"fields%5B{SUBCATEGORY_FIELD}%5D", command)
+            finally:
+                state.close()
+
+    def test_category_activity_write_preserves_subcategory(self):
+        selected = activity_row(501, deal_id=1)
+        plan = activity_plan(
+            [selected],
+            [selected],
+            desired=("cat-new", "sub-old"),
+            category_only=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(
+                    state,
+                    1,
+                    desired=("cat-new", "sub-old"),
+                    evidence_mode="category_activities",
+                )
+                bitrix = ActivityRuntimeBitrix(
+                    live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                    activity_indexes=[[selected]],
+                    details={selected["ID"]: selected},
+                )
+                worker = make_worker(state, bitrix, directory, plan=plan)
+                worker.metadata_resolved_at = time.time()
+                with patch.object(worker, "wait_for_write_slot"), patch.object(
+                    worker, "sleep"
+                ):
+                    worker.process_one_batch()
+                self.assertEqual(state.counts(), {"verified": 1})
+                self.assertEqual(bitrix.live[1][1], "sub-old")
+                self.assertNotIn(
+                    f"fields%5B{SUBCATEGORY_FIELD}%5D",
+                    bitrix.update_commands[0],
+                )
+            finally:
+                state.close()
+
+    def test_final_activity_index_error_isolated_to_one_deal(self):
+        selected_by_deal = {
+            deal_id: activity_row(500 + deal_id, deal_id=deal_id)
+            for deal_id in (1, 2)
+        }
+        records = []
+        for deal_id, selected in selected_by_deal.items():
+            records.append(
+                (
+                    deal_id,
+                    ("cat-old", "sub-old"),
+                    ("cat-new", "sub-new"),
+                    "activities",
+                    canonical_activity_evidence(
+                        deal_id, [selected], [selected]
+                    ),
+                    activity_index_guard_fingerprint(
+                        TEST_KEY,
+                        deal_id,
+                        canonical_activity_index(deal_id, [selected]),
+                    ),
+                    [
+                        activity_locator_fingerprint(
+                            TEST_KEY, deal_id, "email", selected["ID"]
+                        )
+                    ],
+                )
+            )
+        plan = approved_plan(records)
+
+        class IsolatedFailureBitrix(ActivityRuntimeBitrix):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.direct_counts = {1: 0, 2: 0}
+
+            def call(self, method, params=None):
+                if method == "crm.activity.list":
+                    deal_id = int(params["filter"]["BINDINGS"][0]["OWNER_ID"])
+                    self.calls.append((method, params))
+                    count = self.direct_counts[deal_id]
+                    self.direct_counts[deal_id] += 1
+                    if deal_id == 1 and count >= 2:
+                        raise RuntimeError("ACCESS_DENIED")
+                    return [selected_by_deal[deal_id]]
+                if method == "batch" and any(
+                    command.startswith("crm.activity.list?")
+                    for command in (params or {}).get("cmd", {}).values()
+                ):
+                    self.calls.append((method, params))
+                    results = {}
+                    errors = {}
+                    for name, command in params["cmd"].items():
+                        values = parse_qs(urlsplit(command).query)
+                        deal_id = int(
+                            values["filter[BINDINGS][0][OWNER_ID]"][0]
+                        )
+                        if deal_id == 1:
+                            errors[name] = {"error": "ACCESS_DENIED"}
+                        else:
+                            results[name] = [selected_by_deal[deal_id]]
+                    return {"result": results, "result_error": errors}
+                return super().call(method, params)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, evidence_mode="activities")
+                enqueue(state, 2, evidence_mode="activities")
+                bitrix = IsolatedFailureBitrix(
+                    live={
+                        1: ("cat-old", "sub-old", "NEW", "", ""),
+                        2: ("cat-old", "sub-old", "NEW", "", ""),
+                    },
+                    activity_indexes=[[selected_by_deal[1]]],
+                    details={
+                        selected["ID"]: selected
+                        for selected in selected_by_deal.values()
+                    },
+                )
+                worker = make_worker(state, bitrix, directory, plan=plan)
+                worker.metadata_resolved_at = time.time()
+                with patch.object(worker, "wait_for_write_slot"), patch.object(
+                    worker, "sleep"
+                ):
+                    worker.process_one_batch()
+                self.assertEqual(
+                    state.counts(),
+                    {"permanent_error": 1, "verified": 1},
+                )
+                self.assertEqual(len(bitrix.update_commands), 1)
+                self.assertIn("id=2", bitrix.update_commands[0])
+            finally:
+                state.close()
+
+    def test_final_activity_binding_error_isolated_to_one_deal(self):
+        selected_by_deal = {
+            deal_id: activity_row(600 + deal_id, deal_id=deal_id)
+            for deal_id in (1, 2)
+        }
+        records = []
+        for deal_id, selected in selected_by_deal.items():
+            records.append(
+                (
+                    deal_id,
+                    ("cat-old", "sub-old"),
+                    ("cat-new", "sub-new"),
+                    "activities",
+                    canonical_activity_evidence(
+                        deal_id, [selected], [selected]
+                    ),
+                    activity_index_guard_fingerprint(
+                        TEST_KEY,
+                        deal_id,
+                        canonical_activity_index(deal_id, [selected]),
+                    ),
+                    [
+                        activity_locator_fingerprint(
+                            TEST_KEY, deal_id, "email", selected["ID"]
+                        )
+                    ],
+                )
+            )
+        plan = approved_plan(records)
+
+        class IsolatedBindingFailureBitrix(ActivityRuntimeBitrix):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.binding_batches = 0
+
+            def call(self, method, params=None):
+                params = params or {}
+                commands = params.get("cmd", {})
+                if method == "crm.activity.list":
+                    self.calls.append((method, params))
+                    deal_id = int(params["filter"]["BINDINGS"][0]["OWNER_ID"])
+                    return self._activity_page(
+                        [selected_by_deal[deal_id]],
+                        int(params["filter"][">ID"]),
+                    )
+                if method == "batch" and commands and all(
+                    command.startswith("crm.activity.list?")
+                    for command in commands.values()
+                ):
+                    self.calls.append((method, params))
+                    results = {}
+                    for name, command in commands.items():
+                        values = parse_qs(urlsplit(command).query)
+                        deal_id = int(
+                            values["filter[BINDINGS][0][OWNER_ID]"][0]
+                        )
+                        results[name] = self._activity_page(
+                            [selected_by_deal[deal_id]],
+                            int(values["filter[>ID]"][0]),
+                        )
+                    return {"result": results, "result_error": []}
+                if method == "batch" and commands and all(
+                    command.startswith("crm.activity.binding.list?")
+                    for command in commands.values()
+                ):
+                    self.binding_batches += 1
+                    if self.binding_batches == 5:
+                        self.calls.append((method, params))
+                        return {
+                            "result": {},
+                            "result_error": {
+                                next(iter(commands)): {
+                                    "error": "ACCESS_DENIED"
+                                }
+                            },
+                        }
+                return super().call(method, params)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, evidence_mode="activities")
+                enqueue(state, 2, evidence_mode="activities")
+                bitrix = IsolatedBindingFailureBitrix(
+                    live={
+                        1: ("cat-old", "sub-old", "NEW", "", ""),
+                        2: ("cat-old", "sub-old", "NEW", "", ""),
+                    },
+                    activity_indexes=[[]],
+                    details={
+                        selected["ID"]: selected
+                        for selected in selected_by_deal.values()
+                    },
+                )
+                worker = make_worker(state, bitrix, directory, plan=plan)
+                worker.metadata_resolved_at = time.time()
+                with patch.object(worker, "wait_for_write_slot"), patch.object(
+                    worker, "sleep"
+                ):
+                    worker.process_one_batch()
+                self.assertEqual(
+                    state.counts(),
+                    {"permanent_error": 1, "verified": 1},
+                )
+                self.assertEqual(len(bitrix.update_commands), 1)
+                self.assertIn("id=2", bitrix.update_commands[0])
+            finally:
+                state.close()
+
+    def test_activity_body_or_index_race_causes_conflict_without_write(self):
+        selected = activity_row(501, deal_id=1)
+        changed_body = dict(selected)
+        changed_body["DESCRIPTION"] += "changed"
+        changed_binding = dict(selected)
+        changed_binding["BINDINGS"] = [
+            {"OWNER_TYPE_ID": "3", "OWNER_ID": "77"},
+            {"OWNER_TYPE_ID": "2", "OWNER_ID": "999"},
+        ]
+        rebound_index = dict(selected)
+        rebound_index["BINDINGS"] = [
+            {"OWNER_TYPE_ID": "3", "OWNER_ID": "77"},
+            {"OWNER_TYPE_ID": "2", "OWNER_ID": "999"},
+        ]
+        changed_index = dict(selected)
+        changed_index["SUBJECT"] += " changed"
+        cases = (
+            ("body", [[selected]], changed_body),
+            ("get-binding", [[selected]], changed_binding),
+            ("binding-between-a-b", [[selected], [rebound_index]], selected),
+            (
+                "binding-after-b",
+                [[selected], [selected], [rebound_index]],
+                selected,
+            ),
+            ("index-between-a-b", [[selected], [changed_index]], selected),
+            (
+                "index-after-b",
+                [[selected], [selected], [changed_index]],
+                selected,
+            ),
+        )
+        for name, indexes, detail in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    enqueue(state, 1, evidence_mode="activities")
+                    bitrix = ActivityRuntimeBitrix(
+                        live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                        activity_indexes=indexes,
+                        details={selected["ID"]: detail},
+                    )
+                    worker = make_worker(
+                        state,
+                        bitrix,
+                        directory,
+                        plan=activity_plan([selected], [selected]),
+                    )
+                    worker.metadata_resolved_at = time.time()
+                    with patch.object(worker, "wait_for_write_slot"):
+                        worker.process_one_batch()
+                    self.assertEqual(state.counts(), {"conflict": 1})
+                    self.assertEqual(bitrix.update_commands, [])
+                finally:
+                    state.close()
+
+    def test_activity_index_add_delete_rebind_or_metadata_change_is_conflict(self):
+        selected = activity_row(501, deal_id=1)
+        added = activity_row(502, deal_id=1)
+        rebound = dict(selected)
+        rebound["BINDINGS"] = [{"OWNER_TYPE_ID": "3", "OWNER_ID": "77"}]
+        metadata = dict(selected)
+        metadata["PROVIDER_TYPE_ID"] = "CHANGED"
+        cases = (
+            ("add", [selected, added]),
+            ("delete", []),
+            ("rebind", [rebound]),
+            ("metadata", [metadata]),
+        )
+        for name, live_index in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    enqueue(state, 1, evidence_mode="activities")
+                    bitrix = ActivityRuntimeBitrix(
+                        live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                        activity_indexes=[live_index],
+                        details={selected["ID"]: selected},
+                    )
+                    worker = make_worker(
+                        state,
+                        bitrix,
+                        directory,
+                        plan=activity_plan([selected], [selected]),
+                    )
+                    worker.metadata_resolved_at = time.time()
+                    with patch.object(worker, "wait_for_write_slot"):
+                        worker.process_one_batch()
+                    self.assertEqual(state.counts(), {"conflict": 1})
+                    self.assertEqual(bitrix.update_commands, [])
+                    self.assertFalse(
+                        any(
+                            method == "batch"
+                            and any(
+                                command.startswith("crm.activity.get?")
+                                for command in params["cmd"].values()
+                            )
+                            for method, params in bitrix.calls
+                        )
+                    )
+                finally:
+                    state.close()
+
+    def test_activity_locator_missing_and_deal_change_are_fail_closed(self):
+        selected = activity_row(501, deal_id=1)
+        plan = activity_plan([selected], [selected])
+        target = desired_fingerprint(TEST_KEY, 1, "cat-new", "sub-new")
+        missing_locator = activity_locator_fingerprint(TEST_KEY, 1, "email", 999)
+        missing_plan = ApprovedPlan(
+            plan.year,
+            plan.count,
+            plan.transitions,
+            plan.desired_modes,
+            plan.digest,
+            plan.key,
+            plan.subcategory_guards,
+            plan.activity_index_guards,
+            {target: (missing_locator,)},
+            {
+                target: PlanEntry(
+                    transition=next(iter(plan.transitions)),
+                    target=target,
+                    evidence_mode="activities",
+                    activity_index_guard=plan.activity_index_guards[target],
+                    activity_locators=(missing_locator,),
+                )
+            },
+        )
+
+        class ChangingDealBitrix(ActivityRuntimeBitrix):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.deal_reads = 0
+
+            def _deal_rows(self, deal_ids):
+                self.deal_reads += 1
+                if self.deal_reads == 2:
+                    old = self.live[1]
+                    self.live[1] = ("manual", old[1], old[2], old[3], old[4])
+                return super()._deal_rows(deal_ids)
+
+        cases = (
+            ("missing-locator", missing_plan, ActivityRuntimeBitrix),
+            ("deal-change", plan, ChangingDealBitrix),
+        )
+        for name, case_plan, bitrix_class in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    enqueue(state, 1, evidence_mode="activities")
+                    bitrix = bitrix_class(
+                        live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                        activity_indexes=[[selected]],
+                        details={selected["ID"]: selected},
+                    )
+                    worker = make_worker(state, bitrix, directory, plan=case_plan)
+                    worker.metadata_resolved_at = time.time()
+                    with patch.object(worker, "wait_for_write_slot"):
+                        worker.process_one_batch()
+                    self.assertEqual(state.counts(), {"conflict": 1})
+                    self.assertEqual(bitrix.update_commands, [])
+                finally:
+                    state.close()
+
+    def test_activity_preflight_terminal_states_never_fetch_activity(self):
+        selected = activity_row(501, deal_id=1)
+        plan = activity_plan([selected], [selected])
+        cases = (
+            ("excluded", ("cat-old", "sub-old", "DUP", "", ""), "excluded_stage"),
+            ("desired", ("cat-new", "sub-new", "NEW", "", ""), "verified"),
+            ("changed", ("manual", "sub-old", "NEW", "", ""), "conflict"),
+        )
+        for name, live, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    enqueue(state, 1, evidence_mode="activities")
+                    bitrix = ActivityRuntimeBitrix(
+                        live={1: live},
+                        activity_indexes=[[selected]],
+                        details={selected["ID"]: selected},
+                    )
+                    worker = make_worker(state, bitrix, directory, plan=plan)
+                    worker.excluded_stage_ids = {"DUP"}
+                    worker.metadata_resolved_at = time.time()
+                    with patch.object(worker, "wait_for_write_slot"):
+                        worker.process_one_batch()
+                    self.assertEqual(state.counts(), {expected: 1})
+                    self.assertFalse(
+                        any(method.startswith("crm.activity") for method, _ in bitrix.calls)
+                    )
+                finally:
+                    state.close()
+
+    def test_call_transcript_null_and_activity_partial_error_never_write(self):
+        call = activity_row(
+            987654321,
+            deal_id=1,
+            kind="call",
+            transcription="SENTINEL-TRANSCRIPT-31b2",
+        )
+        plan = activity_plan([call], [call])
+        cases = (
+            ("null-transcript", {}, {}, "conflict"),
+            (
+                "partial-error",
+                {call["ID"]: {"transcription": call["transcription"]}},
+                {call["ID"]: {"error": "ACCESS_DENIED"}},
+                "permanent_error",
+            ),
+        )
+        for name, transcripts, detail_errors, expected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    enqueue(state, 1, evidence_mode="activities")
+                    bitrix = ActivityRuntimeBitrix(
+                        live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                        activity_indexes=[[call]],
+                        details={call["ID"]: call},
+                        transcripts=transcripts,
+                        detail_errors=detail_errors,
+                    )
+                    worker = make_worker(state, bitrix, directory, plan=plan)
+                    worker.metadata_resolved_at = time.time()
+                    with patch.object(worker, "wait_for_write_slot"):
+                        worker.process_one_batch()
+                    self.assertEqual(state.counts(), {expected: 1})
+                    self.assertEqual(bitrix.update_commands, [])
+                    worker.write_status()
+                finally:
+                    state.close()
+                persisted = b"".join(
+                    path.read_bytes()
+                    for path in Path(directory).iterdir()
+                    if path.is_file()
+                )
+                self.assertNotIn(call["transcription"].encode(), persisted)
+                self.assertNotIn(call["ID"].encode(), persisted)
+
+    def test_call_transcript_batch_method_falls_back_without_changing_raw_text(self):
+        call = activity_row(
+            987654322,
+            deal_id=1,
+            kind="call",
+            transcription="Точный текст расшифровки \r\n",
+        )
+
+        class FallbackBitrix(ActivityRuntimeBitrix):
+            def call(self, method, params=None):
+                if method == "batch" and any(
+                    command.startswith("crm.activity.call.getTranscript?")
+                    for command in (params or {}).get("cmd", {}).values()
+                ):
+                    self.calls.append((method, params))
+                    return {
+                        "result": {},
+                        "result_error": {
+                            "transcript_0": {
+                                "error": "ERROR_BATCH_METHOD_NOT_ALLOWED"
+                            }
+                        },
+                    }
+                return super().call(method, params)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, evidence_mode="activities")
+                bitrix = FallbackBitrix(
+                    live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                    activity_indexes=[[call]],
+                    details={call["ID"]: call},
+                    transcripts={
+                        call["ID"]: {"transcription": call["transcription"]}
+                    },
+                )
+                worker = make_worker(
+                    state,
+                    bitrix,
+                    directory,
+                    plan=activity_plan([call], [call]),
+                )
+                worker.metadata_resolved_at = time.time()
+                with patch.object(worker, "wait_for_write_slot"), patch.object(
+                    worker, "sleep"
+                ):
+                    worker.process_one_batch()
+                self.assertEqual(state.counts(), {"verified": 1})
+                self.assertTrue(
+                    any(
+                        method == "crm.activity.call.getTranscript"
+                        for method, _ in bitrix.calls
+                    )
+                )
+            finally:
+                state.close()
+
+    def test_activity_transport_error_retries_without_persisting_api_payload(self):
+        selected = activity_row(987654323, deal_id=1)
+
+        class TimeoutBitrix(ActivityRuntimeBitrix):
+            def call(self, method, params=None):
+                if method == "crm.activity.list":
+                    self.calls.append((method, params))
+                    raise TimeoutError("timeout with PRIVATE-PAYLOAD-88d1")
+                return super().call(method, params)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, evidence_mode="activities")
+                bitrix = TimeoutBitrix(
+                    live={1: ("cat-old", "sub-old", "NEW", "", "")},
+                    activity_indexes=[[selected]],
+                    details={selected["ID"]: selected},
+                )
+                worker = make_worker(
+                    state,
+                    bitrix,
+                    directory,
+                    plan=activity_plan([selected], [selected]),
+                )
+                worker.metadata_resolved_at = time.time()
+                with patch.object(worker, "wait_for_write_slot"):
+                    worker.process_one_batch()
+                row = state.db.execute(
+                    "SELECT status,attempts,last_error FROM queue WHERE deal_id=1"
+                ).fetchone()
+                self.assertEqual((row["status"], row["attempts"]), ("retry_wait", 1))
+                self.assertEqual(row["last_error"], "Activity evidence временно недоступно")
+                worker.write_status()
+            finally:
+                state.close()
+            persisted = b"".join(
+                path.read_bytes()
+                for path in Path(directory).iterdir()
+                if path.is_file()
+            )
+            self.assertNotIn(b"PRIVATE-PAYLOAD-88d1", persisted)
 
 
 if __name__ == "__main__":

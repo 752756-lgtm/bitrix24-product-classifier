@@ -53,6 +53,13 @@ class CallProcessingService:
             raise ValueError(f"У сделки {deal_id} нет звонков")
         for activity in calls:
             activity_id = int(activity["ID"])
+            binding_deals = _activity_deal_bindings(
+                self.bitrix.get_activity(activity_id)
+            )
+            if str(int(deal_id)) not in binding_deals:
+                raise ValueError(
+                    f"Звонок {activity_id} не привязан к сделке {deal_id}"
+                )
             transcript = self.bitrix.get_call_transcript(activity_id)
             if transcript:
                 result = self.process(deal_id, transcript, dry_run=dry_run)
@@ -70,16 +77,58 @@ def extract_event(payload: dict, bitrix: BitrixClient) -> tuple[int, str]:
     deal_id = _first(flat, "deal_id", "DEAL_ID", "entity_id", "ENTITY_ID", "data[FIELDS][OWNER_ID]")
     transcript = _first(flat, "transcript", "TRANSCRIPT", "text", "TEXT", "description", "DESCRIPTION", "data[FIELDS][DESCRIPTION]")
     activity_id = _first(flat, "activity_id", "ACTIVITY_ID", "ID", "data[FIELDS][ID]")
-    if (not deal_id or not transcript) and activity_id:
+    if activity_id:
         activity = bitrix.get_activity(int(activity_id))
-        transcript = transcript or activity.get("DESCRIPTION")
-        for binding in activity.get("BINDINGS", []):
-            if str(binding.get("OWNER_TYPE_ID")) == "2":
-                deal_id = binding.get("OWNER_ID")
-                break
+        activity_transcript = activity.get("DESCRIPTION")
+        deal_bindings = _activity_deal_bindings(activity)
+        if deal_id:
+            supplied_deal = str(int(deal_id))
+            if supplied_deal not in deal_bindings:
+                raise ValueError("Activity не привязана к указанной сделке")
+            deal_id = supplied_deal
+        elif len(deal_bindings) == 1:
+            deal_id = next(iter(deal_bindings))
+        else:
+            raise ValueError("У activity неоднозначная привязка к сделке")
+        if transcript and activity_transcript and str(transcript) != str(
+            activity_transcript
+        ):
+            raise ValueError("Текст activity не совпадает с payload")
+        transcript = transcript or activity_transcript
     if not deal_id or not transcript:
         raise ValueError("В событии нет deal_id и расшифровки либо activity_id с привязкой к сделке")
     return int(deal_id), str(transcript)
+
+
+def _activity_deal_bindings(activity: dict) -> set[str]:
+    bindings = activity.get("BINDINGS")
+    if not isinstance(bindings, list):
+        raise ValueError("Activity не содержит проверенных bindings")
+    deal_ids: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise ValueError("Activity содержит некорректные bindings")
+        entity_type = binding.get("OWNER_TYPE_ID")
+        entity_id = binding.get("OWNER_ID")
+        if (
+            isinstance(entity_type, bool)
+            or isinstance(entity_id, bool)
+            or not str(entity_type).isdigit()
+            or not str(entity_id).isdigit()
+            or int(entity_type) <= 0
+            or int(entity_id) <= 0
+        ):
+            raise ValueError("Activity содержит некорректные bindings")
+        identity = (str(int(entity_type)), str(int(entity_id)))
+        if identity in seen:
+            raise ValueError("Activity содержит повторяющиеся bindings")
+        seen.add(identity)
+        if identity[0] == "2":
+            deal_ids.add(identity[1])
+    if not deal_ids:
+        raise ValueError("Activity не привязана к сделке")
+    return deal_ids
 
 
 def _first(data: dict, *keys: str):
