@@ -13,6 +13,8 @@ from urllib.parse import parse_qs, urlsplit
 from tools.activity_live_pilot import (
     PilotError,
     ReadOnlyRateLimitedClient,
+    _assert_aggregate_report,
+    _hydrate_activity_bindings,
     _private_write,
     _validate_operational_limits,
     list_activities_batched,
@@ -61,11 +63,14 @@ def activity_row(deal_id: int, kind: str) -> dict[str, object]:
         "START_TIME": "2025-04-01T10:00:00+03:00",
         "END_TIME": "2025-04-01T10:01:00+03:00",
         "COMPLETED": "Y",
-        "BINDINGS": [
-            {"OWNER_TYPE_ID": "2", "OWNER_ID": str(deal_id)},
-            {"OWNER_TYPE_ID": "3", "OWNER_ID": "777"},
-        ],
     }
+
+
+def activity_bindings(deal_id: int) -> list[dict[str, int]]:
+    return [
+        {"entityTypeId": 2, "entityId": deal_id},
+        {"entityTypeId": 3, "entityId": 777},
+    ]
 
 
 class FakeTransport:
@@ -97,6 +102,11 @@ class FakeTransport:
         if parsed.path == "crm.activity.list":
             deal_id = int(params["filter[BINDINGS][0][OWNER_ID]"][0])
             return [activity_row(deal_id, "email"), activity_row(deal_id, "call")]
+        if parsed.path == "crm.activity.binding.list":
+            activity_id = params["activityId"][0]
+            deal_id, _kind, _row = self.by_activity_id[activity_id]
+            start = int(params["start"][0])
+            return activity_bindings(deal_id)[start:start + 50]
         if parsed.path == "crm.activity.get":
             return self._activity_detail(params["id"][0])
         if parsed.path == "crm.activity.call.getTranscript":
@@ -130,6 +140,11 @@ class FakeTransport:
             return [activity_row(deal_id, "email"), activity_row(deal_id, "call")]
         if method == "crm.activity.get":
             return self._activity_detail(str(params["id"]))
+        if method == "crm.activity.binding.list":
+            activity_id = str(params["activityId"])
+            deal_id, _kind, _row = self.by_activity_id[activity_id]
+            start = int(params["start"])
+            return activity_bindings(deal_id)[start:start + 50]
         if method == "crm.activity.call.getTranscript":
             return self._transcript(str(params["activityId"]))
         if method == "batch":
@@ -204,6 +219,21 @@ class ActivityLivePilotTests(unittest.TestCase):
         with self.assertRaisesRegex(PilotError, "under /tmp"):
             _private_write(Path("/workspace/not-private.json"), {"safe": True})
 
+    def test_aggregate_report_rejects_raw_identity_or_binding_keys(self):
+        _assert_aggregate_report(
+            {"activity_bindings_hydrated": 2, "deal_or_activity_ids_persisted": False}
+        )
+        for private_value in (
+            {"BINDINGS": [{"entityId": 1}]},
+            {"entityId": 1},
+            {"OWNER_ID": 1},
+            {"activity_id": 1},
+            {"id": 1},
+        ):
+            with self.subTest(private_value=private_value):
+                with self.assertRaisesRegex(PilotError, "Private evidence key"):
+                    _assert_aggregate_report(private_value)
+
     def test_rate_spacing_is_measured_without_triggering_quota(self):
         clock = Clock()
         transport = FakeTransport()
@@ -218,6 +248,47 @@ class ActivityLivePilotTests(unittest.TestCase):
         self.assertAlmostEqual(
             client.spacing_report()["minimum_observed_start_gap_seconds"], 1.2
         )
+
+    def test_api_call_budget_fails_before_transport(self):
+        transport = FakeTransport()
+        client = ReadOnlyRateLimitedClient(transport, 0, max_calls=2)
+        client.call("crm.category.list", {"entityTypeId": 2})
+        client.call("crm.category.list", {"entityTypeId": 2})
+        with self.assertRaisesRegex(PilotError, "budget"):
+            client.call("crm.category.list", {"entityTypeId": 2})
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(client.spacing_report()["api_call_count"], 2)
+        self.assertEqual(client.spacing_report()["configured_api_call_cap"], 2)
+
+        class CountingTransport:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, method: str, params: dict[str, object]):
+                self.calls += 1
+                return {"result": {}, "result_error": []}
+
+        operations_transport = CountingTransport()
+        operations_client = ReadOnlyRateLimitedClient(
+            operations_transport,
+            0,
+            max_operations=2,
+        )
+        operations_client.call(
+            "batch",
+            {
+                "cmd": {
+                    "one": "crm.category.list?entityTypeId=2",
+                    "two": "crm.status.list?filter[ENTITY_ID]=DEAL_STAGE",
+                }
+            },
+        )
+        with self.assertRaisesRegex(PilotError, "operation budget"):
+            operations_client.call("crm.category.list", {"entityTypeId": 2})
+        self.assertEqual(operations_transport.calls, 1)
+        operation_report = operations_client.spacing_report()
+        self.assertEqual(operation_report["api_operation_count"], 2)
+        self.assertEqual(operation_report["configured_api_operation_cap"], 2)
 
     def test_activity_get_must_match_the_production_v5_snapshot_shape(self):
         class MissingMetadataTransport(FakeTransport):
@@ -313,10 +384,16 @@ class ActivityLivePilotTests(unittest.TestCase):
                 for name, command in params["cmd"].items():
                     parsed = urlsplit(command)
                     query = parse_qs(parsed.query)
-                    last_id = int(query["filter[>ID]"][0])
-                    results[name] = [
-                        row for row in self.rows if int(row["ID"]) > last_id
-                    ][:50]
+                    if parsed.path == "crm.activity.list":
+                        last_id = int(query["filter[>ID]"][0])
+                        results[name] = [
+                            row for row in self.rows if int(row["ID"]) > last_id
+                        ][:50]
+                    elif parsed.path == "crm.activity.binding.list":
+                        start = int(query["start"][0])
+                        results[name] = activity_bindings(31001)[start:start + 50]
+                    else:
+                        raise AssertionError(f"unexpected method: {parsed.path}")
                 return {"result": results, "result_error": {}}
 
         with self.assertRaisesRegex(PilotError, "protocol cap"):
@@ -326,6 +403,117 @@ class ActivityLivePilotTests(unittest.TestCase):
                 batch_size=1,
                 max_pages=5,
             )
+
+    def test_binding_hydration_is_paginated_exact_and_fail_closed(self):
+        row = activity_row(31001, "email")
+        exact = [
+            {"entityTypeId": 2, "entityId": 31001},
+            *(
+                {"entityTypeId": 3, "entityId": value}
+                for value in range(1, 100)
+            ),
+        ]
+
+        class BindingTransport:
+            def __init__(self, values):
+                self.values = list(values)
+                self.starts = []
+
+            def call(self, method: str, params: dict[str, object]):
+                if method != "batch":
+                    raise AssertionError(f"unexpected method: {method}")
+                results = {}
+                for name, command in params["cmd"].items():
+                    parsed = urlsplit(command)
+                    if parsed.path != "crm.activity.binding.list":
+                        raise AssertionError(f"unexpected command: {command}")
+                    query = parse_qs(parsed.query)
+                    start = int(query["start"][0])
+                    self.starts.append(start)
+                    results[name] = self.values[start:start + 50]
+                return {"result": results, "result_error": []}
+
+        transport = BindingTransport(exact)
+        hydrated, binding_only, metrics = _hydrate_activity_bindings(
+            pilot_client(transport),
+            31001,
+            [row],
+        )
+        self.assertEqual(len(hydrated[0]["BINDINGS"]), 100)
+        self.assertEqual(transport.starts, [0, 50, 100])
+        self.assertEqual(binding_only, 1)
+        self.assertEqual(metrics["pages"], 3)
+        self.assertEqual(metrics["maximum_for_one_activity"], 100)
+
+        class DirectFallbackBindingTransport(BindingTransport):
+            def __init__(self, values):
+                super().__init__(values)
+                self.direct_starts = []
+
+            def call(self, method: str, params: dict[str, object]):
+                if method == "batch":
+                    return {
+                        "result": {},
+                        "result_error": {
+                            name: {"error": "ERROR_BATCH_METHOD_NOT_ALLOWED"}
+                            for name in params["cmd"]
+                        },
+                    }
+                if method == "crm.activity.binding.list":
+                    start = int(params["start"])
+                    self.direct_starts.append(start)
+                    return self.values[start:start + 50]
+                raise AssertionError(f"unexpected method: {method}")
+
+        fallback = DirectFallbackBindingTransport(exact)
+        fallback_hydrated, _binding_only, fallback_metrics = (
+            _hydrate_activity_bindings(
+                pilot_client(fallback),
+                31001,
+                [row],
+            )
+        )
+        self.assertEqual(len(fallback_hydrated[0]["BINDINGS"]), 100)
+        self.assertEqual(fallback.direct_starts, [0, 50, 100])
+        self.assertFalse(fallback_metrics["batch_supported"])
+
+        class MissingBindingResultTransport:
+            def call(self, method: str, params: dict[str, object]):
+                if method == "batch":
+                    return {"result": {}, "result_error": []}
+                raise AssertionError(f"unexpected method: {method}")
+
+        with self.assertRaisesRegex(PilotError, "omitted"):
+            _hydrate_activity_bindings(
+                pilot_client(MissingBindingResultTransport()),
+                31001,
+                [row],
+            )
+
+        invalid = (
+            ("overflow", [*exact, {"entityTypeId": 4, "entityId": 999}]),
+            ("duplicate", [*exact[:-1], exact[0]]),
+            ("wrong-type", [{"entityTypeId": "2", "entityId": 31001}]),
+            ("zero", [{"entityTypeId": 2, "entityId": 0}]),
+            (
+                "alias-conflict",
+                [
+                    {
+                        "entityTypeId": 2,
+                        "entityId": 31001,
+                        "OWNER_ID": 1,
+                    }
+                ],
+            ),
+        )
+        for name, values in invalid:
+            with self.subTest(name=name):
+                with self.assertRaises(PilotError):
+                    _hydrate_activity_bindings(
+                        pilot_client(BindingTransport(values)),
+                        31001,
+                        [row],
+                    )
 
     def test_direct_cli_bootstraps_repo_imports_before_live_validation(self):
         script = Path(__file__).resolve().parents[1] / "tools/activity_live_pilot.py"

@@ -3,9 +3,9 @@
 
 The probe intentionally has no write-capable Bitrix method in its allowlist. It
 discovers a small sample of still-unclassified 2025 deals, verifies the real
-activity list/get/transcript response shapes, and writes aggregate diagnostics
-only. Raw subjects, message bodies, transcripts, deal IDs and activity IDs are
-never serialized.
+activity list/binding/get/transcript response shapes, and writes aggregate
+diagnostics only. Raw subjects, message bodies, transcripts, deal IDs and
+activity IDs are never serialized.
 """
 
 from __future__ import annotations
@@ -31,14 +31,17 @@ from classifier.precision_plan import (
     MAX_RELEVANT_ACTIVITIES,
     activity_is_bound_to_deal,
     activity_kind,
+    canonical_activity_bindings,
     canonical_activity_evidence,
     canonical_activity_index,
 )
 from classifier.precision_worker import (
+    ACTIVITY_BINDING_BATCH_SIZE,
     ACTIVITY_INDEX_FIELDS,
     ACTIVITY_PAGE_SIZE,
     CATEGORY_FIELD,
     EXCLUDED_STAGE_NAMES,
+    MAX_ACTIVITY_BINDINGS,
     SUBCATEGORY_FIELD,
     normalize_stage_name,
     normalized,
@@ -48,6 +51,7 @@ from classifier.precision_worker import (
 READ_ONLY_METHODS = frozenset(
     {
         "batch",
+        "crm.activity.binding.list",
         "crm.activity.call.getTranscript",
         "crm.activity.get",
         "crm.activity.list",
@@ -64,6 +68,8 @@ MAX_SAFE_ACTIVITY_PAGES = 20
 MAX_SAFE_CONTENT_ROWS = 20
 MAX_SAFE_INTERVAL_SECONDS = 10.0
 MAX_SAFE_DIRECT_COMPARE = 5
+MAX_SAFE_API_CALLS = 600
+MAX_SAFE_API_OPERATIONS = 12_000
 
 
 class PilotError(RuntimeError):
@@ -140,11 +146,28 @@ class ReadOnlyRateLimitedClient:
         transport: Any,
         min_interval: float,
         *,
+        max_calls: int = MAX_SAFE_API_CALLS,
+        max_operations: int = MAX_SAFE_API_OPERATIONS,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ):
+        if (
+            not isinstance(max_calls, int)
+            or isinstance(max_calls, bool)
+            or not 1 <= max_calls <= MAX_SAFE_API_CALLS
+        ):
+            raise PilotError("API call budget is outside the safe range")
+        if (
+            not isinstance(max_operations, int)
+            or isinstance(max_operations, bool)
+            or not 1 <= max_operations <= MAX_SAFE_API_OPERATIONS
+        ):
+            raise PilotError("API operation budget is outside the safe range")
         self.transport = transport
         self.min_interval = max(0.0, float(min_interval))
+        self.max_calls = max_calls
+        self.max_operations = max_operations
+        self.api_operations = 0
         self._sleep = sleep
         self._monotonic = monotonic
         self.started_at: list[float] = []
@@ -164,12 +187,20 @@ class ReadOnlyRateLimitedClient:
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
         self._validate(method, params)
+        if len(self.started_at) >= self.max_calls:
+            raise PilotError("Pilot API call budget was exhausted")
+        operation_count = (
+            len((params or {}).get("cmd", {})) if method == "batch" else 1
+        )
+        if self.api_operations + operation_count > self.max_operations:
+            raise PilotError("Pilot API operation budget was exhausted")
         if self.started_at:
             remaining = self.started_at[-1] + self.min_interval - self._monotonic()
             if remaining > 0:
                 self._sleep(remaining)
         started = self._monotonic()
         self.started_at.append(started)
+        self.api_operations += operation_count
         try:
             return self.transport.call(method, params or {})
         except Exception as exc:
@@ -186,6 +217,9 @@ class ReadOnlyRateLimitedClient:
         minimum = min(gaps) if gaps else None
         return {
             "api_call_count": len(self.started_at),
+            "configured_api_call_cap": self.max_calls,
+            "api_operation_count": self.api_operations,
+            "configured_api_operation_cap": self.max_operations,
             "configured_min_interval_seconds": self.min_interval,
             "minimum_observed_start_gap_seconds": (
                 round(minimum, 4) if minimum is not None else None
@@ -348,38 +382,258 @@ def _activity_list_command(deal_id: int, last_id: int) -> str:
     return "crm.activity.list?" + urlencode(fields)
 
 
+def _activity_binding_command(activity_id: object, start: int) -> str:
+    normalized_id = normalized(activity_id)
+    if (
+        not normalized_id.isdigit()
+        or int(normalized_id) <= 0
+        or start not in {0, ACTIVITY_PAGE_SIZE, MAX_ACTIVITY_BINDINGS}
+    ):
+        raise PilotError("Activity binding request had an invalid cursor")
+    return "crm.activity.binding.list?" + urlencode(
+        [("activityId", normalized_id), ("start", str(start))]
+    )
+
+
+def _binding_rows(value: Any) -> list[dict[str, Any]]:
+    if (
+        not isinstance(value, list)
+        or len(value) > ACTIVITY_PAGE_SIZE
+        or any(not isinstance(row, dict) for row in value)
+    ):
+        raise PilotError("Unexpected activity-binding response shape")
+    for row in value:
+        if (
+            set(row).intersection(
+                {
+                    "OWNER_TYPE_ID",
+                    "ownerTypeId",
+                    "OWNER_ID",
+                    "ownerId",
+                }
+            )
+            or not isinstance(row.get("entityTypeId"), int)
+            or isinstance(row.get("entityTypeId"), bool)
+            or not isinstance(row.get("entityId"), int)
+            or isinstance(row.get("entityId"), bool)
+            or int(row["entityTypeId"]) <= 0
+            or int(row["entityId"]) <= 0
+        ):
+            raise PilotError("Unexpected activity-binding response shape")
+    try:
+        canonical_activity_bindings(value)
+    except ValueError:
+        raise PilotError("Unexpected activity-binding response shape") from None
+    return value
+
+
+def _fetch_binding_page_group(
+    client: ReadOnlyRateLimitedClient,
+    group: list[tuple[int, dict[str, Any]]],
+    *,
+    start: int,
+) -> tuple[dict[int, list[dict[str, Any]]], dict[str, object]]:
+    commands = {
+        f"binding_{position}": _activity_binding_command(
+            row.get("ID", row.get("id")),
+            start,
+        )
+        for position, row in group
+    }
+    batch_supported = True
+    batch_calls = 1
+    direct_calls = 0
+    fallback_all = False
+    try:
+        results, errors = _batch_parts(
+            client.call("batch", {"halt": 0, "cmd": commands})
+        )
+    except PilotApiError as exc:
+        if exc.code != METHOD_NOT_ALLOWED:
+            raise
+        batch_supported = False
+        fallback_all = True
+        results, errors = {}, {}
+
+    expected = set(commands)
+    if set(results).difference(expected) or set(errors).difference(expected):
+        raise PilotError("Batch returned an unexpected activity-binding key")
+
+    pages: dict[int, list[dict[str, Any]]] = {}
+    for position, row in group:
+        name = f"binding_{position}"
+        if fallback_all or name in errors:
+            if not fallback_all:
+                code = _safe_error_code(errors[name])
+                if code != METHOD_NOT_ALLOWED:
+                    raise PilotApiError("crm.activity.binding.list", code)
+                batch_supported = False
+            activity_id = normalized(row.get("ID", row.get("id")))
+            page = client.call(
+                "crm.activity.binding.list",
+                {"activityId": activity_id, "start": start},
+            )
+            direct_calls += 1
+        else:
+            if name not in results:
+                raise PilotError("Batch omitted an activity-binding result")
+            page = results[name]
+        pages[position] = _binding_rows(page)
+    return pages, {
+        "batch_supported": batch_supported,
+        "batch_calls": batch_calls,
+        "direct_calls": direct_calls,
+    }
+
+
+def _fetch_binding_pages(
+    client: ReadOnlyRateLimitedClient,
+    group: list[tuple[int, dict[str, Any]]],
+    *,
+    start: int,
+) -> tuple[dict[int, list[dict[str, Any]]], dict[str, object]]:
+    pages: dict[int, list[dict[str, Any]]] = {}
+    batch_supported = True
+    batch_calls = 0
+    direct_calls = 0
+    for offset in range(0, len(group), ACTIVITY_BINDING_BATCH_SIZE):
+        part, metrics = _fetch_binding_page_group(
+            client,
+            group[offset:offset + ACTIVITY_BINDING_BATCH_SIZE],
+            start=start,
+        )
+        pages.update(part)
+        batch_supported = batch_supported and bool(metrics["batch_supported"])
+        batch_calls += int(metrics["batch_calls"])
+        direct_calls += int(metrics["direct_calls"])
+    return pages, {
+        "batch_supported": batch_supported,
+        "batch_calls": batch_calls,
+        "direct_calls": direct_calls,
+    }
+
+
+def _hydrate_activity_bindings(
+    client: ReadOnlyRateLimitedClient,
+    deal_id: int,
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, dict[str, object]]:
+    if not rows:
+        return [], 0, {
+            "batch_supported": True,
+            "batch_calls": 0,
+            "direct_calls": 0,
+            "pages": 0,
+            "rows": 0,
+            "maximum_for_one_activity": 0,
+        }
+    indexed_rows = list(enumerate(rows))
+    bindings, first_metrics = _fetch_binding_pages(
+        client,
+        indexed_rows,
+        start=0,
+    )
+    metrics = {
+        "batch_supported": bool(first_metrics["batch_supported"]),
+        "batch_calls": int(first_metrics["batch_calls"]),
+        "direct_calls": int(first_metrics["direct_calls"]),
+        "pages": len(indexed_rows),
+    }
+    second_group = [
+        item for item in indexed_rows
+        if len(bindings[item[0]]) == ACTIVITY_PAGE_SIZE
+    ]
+    if second_group:
+        second, second_metrics = _fetch_binding_pages(
+            client,
+            second_group,
+            start=ACTIVITY_PAGE_SIZE,
+        )
+        metrics["batch_supported"] = (
+            bool(metrics["batch_supported"])
+            and bool(second_metrics["batch_supported"])
+        )
+        metrics["batch_calls"] = int(metrics["batch_calls"]) + int(
+            second_metrics["batch_calls"]
+        )
+        metrics["direct_calls"] = int(metrics["direct_calls"]) + int(
+            second_metrics["direct_calls"]
+        )
+        metrics["pages"] = int(metrics["pages"]) + len(second_group)
+        for position, _row in second_group:
+            bindings[position] = [*bindings[position], *second[position]]
+    cap_group = [
+        item for item in second_group
+        if len(bindings[item[0]]) == MAX_ACTIVITY_BINDINGS
+    ]
+    if cap_group:
+        eof, eof_metrics = _fetch_binding_pages(
+            client,
+            cap_group,
+            start=MAX_ACTIVITY_BINDINGS,
+        )
+        metrics["batch_supported"] = (
+            bool(metrics["batch_supported"])
+            and bool(eof_metrics["batch_supported"])
+        )
+        metrics["batch_calls"] = int(metrics["batch_calls"]) + int(
+            eof_metrics["batch_calls"]
+        )
+        metrics["direct_calls"] = int(metrics["direct_calls"]) + int(
+            eof_metrics["direct_calls"]
+        )
+        metrics["pages"] = int(metrics["pages"]) + len(cap_group)
+        if any(eof[position] for position, _row in cap_group):
+            raise PilotError("Activity binding protocol cap was exceeded")
+
+    hydrated: list[dict[str, Any]] = []
+    binding_only = 0
+    maximum = 0
+    binding_count = 0
+    for position, row in indexed_rows:
+        raw_bindings = bindings[position]
+        try:
+            canonical = canonical_activity_bindings(raw_bindings)
+        except ValueError:
+            raise PilotError("Unexpected activity-binding response shape") from None
+        if len(canonical) != len(raw_bindings):
+            raise PilotError("Activity-binding pages contained duplicates")
+        snapshot = dict(row)
+        snapshot["BINDINGS"] = raw_bindings
+        try:
+            if not activity_is_bound_to_deal(snapshot, deal_id):
+                raise PilotError("Activity binding filter returned a foreign row")
+            canonical_activity_index(deal_id, [snapshot])
+        except ValueError:
+            raise PilotError("Relevant activity index shape was invalid") from None
+        if normalized(row.get("OWNER_TYPE_ID", row.get("ownerTypeId"))) != "2" or normalized(
+            row.get("OWNER_ID", row.get("ownerId"))
+        ) != str(deal_id):
+            binding_only += 1
+        binding_count += len(raw_bindings)
+        maximum = max(maximum, len(raw_bindings))
+        hydrated.append(snapshot)
+    metrics["rows"] = binding_count
+    metrics["maximum_for_one_activity"] = maximum
+    return hydrated, binding_only, metrics
+
+
 def _validate_activity_page(
     value: Any,
     *,
-    deal_id: int,
     last_id: int,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int]:
     page = _rows(value, "activities")
     relevant: list[dict[str, Any]] = []
     page_last = last_id
-    binding_only = 0
     for row in page:
         raw_id = normalized(row.get("ID", row.get("id")))
         if not raw_id.isdigit() or int(raw_id) <= page_last:
             raise PilotError("Activity keyset pagination was not strictly increasing")
         page_last = int(raw_id)
-        try:
-            bound = activity_is_bound_to_deal(row, deal_id)
-        except ValueError:
-            raise PilotError("Activity binding response shape was invalid") from None
-        if not bound:
-            raise PilotError("Activity binding filter returned a foreign row")
-        if normalized(row.get("OWNER_TYPE_ID", row.get("ownerTypeId"))) != "2" or normalized(
-            row.get("OWNER_ID", row.get("ownerId"))
-        ) != str(deal_id):
-            binding_only += 1
         if activity_kind(row) is not None:
-            try:
-                canonical_activity_index(deal_id, [row])
-            except ValueError:
-                raise PilotError("Relevant activity index shape was invalid") from None
             relevant.append(row)
-    return relevant, page_last, binding_only
+    return relevant, page_last
 
 
 def _list_one_direct(
@@ -387,12 +641,18 @@ def _list_one_direct(
     deal_id: int,
     *,
     max_pages: int,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, object]]:
     last_id = 0
     relevant: list[dict[str, Any]] = []
     pages = 0
     raw_rows = 0
     binding_only = 0
+    binding_batch_supported = True
+    binding_batch_calls = 0
+    binding_direct_calls = 0
+    binding_pages = 0
+    binding_rows = 0
+    maximum_bindings = 0
     while pages < max_pages:
         value = client.call(
             "crm.activity.list",
@@ -407,21 +667,45 @@ def _list_one_direct(
             },
         )
         page = _rows(value, "activities")
-        page_relevant, page_last, page_binding_only = _validate_activity_page(
-            value, deal_id=deal_id, last_id=last_id
+        page_relevant, page_last = _validate_activity_page(
+            value, last_id=last_id
         )
         pages += 1
         raw_rows += len(page)
-        binding_only += page_binding_only
-        relevant.extend(page_relevant)
-        if len(relevant) > MAX_RELEVANT_ACTIVITIES:
+        if len(relevant) + len(page_relevant) > MAX_RELEVANT_ACTIVITIES:
             raise PilotError("Relevant activity protocol cap was exceeded")
+        hydrated, page_binding_only, binding_metrics = _hydrate_activity_bindings(
+            client,
+            deal_id,
+            page_relevant,
+        )
+        binding_only += page_binding_only
+        relevant.extend(hydrated)
+        binding_batch_supported = (
+            binding_batch_supported and bool(binding_metrics["batch_supported"])
+        )
+        binding_batch_calls += int(binding_metrics["batch_calls"])
+        binding_direct_calls += int(binding_metrics["direct_calls"])
+        binding_pages += int(binding_metrics["pages"])
+        binding_rows += int(binding_metrics["rows"])
+        maximum_bindings = max(
+            maximum_bindings,
+            int(binding_metrics["maximum_for_one_activity"]),
+        )
         if len(page) < ACTIVITY_PAGE_SIZE:
             return relevant, {
                 "pages": pages,
                 "raw_rows": raw_rows,
                 "binding_only_rows": binding_only,
+                "binding_batch_supported": binding_batch_supported,
+                "binding_batch_calls": binding_batch_calls,
+                "binding_direct_calls": binding_direct_calls,
+                "binding_pages": binding_pages,
+                "binding_rows": binding_rows,
+                "maximum_bindings_for_one_activity": maximum_bindings,
             }
+        if pages >= max_pages:
+            raise PilotError("Activity page safety limit was reached")
         if page_last <= last_id:
             raise PilotError("Activity keyset cursor did not advance")
         last_id = page_last
@@ -443,6 +727,12 @@ def list_activities_batched(
     binding_only = 0
     batch_supported = True
     batch_calls = 0
+    binding_batch_supported = True
+    binding_batch_calls = 0
+    binding_direct_calls = 0
+    binding_pages = 0
+    binding_rows = 0
+    maximum_bindings = 0
     while pending:
         next_pending: list[int] = []
         for start in range(0, len(pending), batch_size):
@@ -463,6 +753,12 @@ def list_activities_batched(
                 results, errors = {}, {
                     name: {"error": METHOD_NOT_ALLOWED} for name in commands
                 }
+            expected_names = set(commands)
+            if (
+                set(results).difference(expected_names)
+                or set(errors).difference(expected_names)
+            ):
+                raise PilotError("Batch returned an unexpected activity-list key")
             for offset, deal_id in enumerate(group):
                 name = f"row_{offset}"
                 if name in errors:
@@ -477,22 +773,51 @@ def list_activities_batched(
                     page_counts[deal_id] = metrics["pages"]
                     raw_rows += metrics["raw_rows"]
                     binding_only += metrics["binding_only_rows"]
+                    binding_batch_supported = (
+                        binding_batch_supported
+                        and bool(metrics["binding_batch_supported"])
+                    )
+                    binding_batch_calls += int(metrics["binding_batch_calls"])
+                    binding_direct_calls += int(metrics["binding_direct_calls"])
+                    binding_pages += int(metrics["binding_pages"])
+                    binding_rows += int(metrics["binding_rows"])
+                    maximum_bindings = max(
+                        maximum_bindings,
+                        int(metrics["maximum_bindings_for_one_activity"]),
+                    )
                     continue
                 if name not in results:
                     raise PilotError("Batch omitted an activity-list result")
                 if page_counts[deal_id] >= max_pages:
                     raise PilotError("Activity page safety limit was reached")
                 page = _rows(results[name], "activities")
-                rows, page_last, page_binding_only = _validate_activity_page(
-                    results[name], deal_id=deal_id, last_id=last_ids[deal_id]
+                rows, page_last = _validate_activity_page(
+                    results[name], last_id=last_ids[deal_id]
                 )
                 page_counts[deal_id] += 1
                 raw_rows += len(page)
-                binding_only += page_binding_only
-                relevant[deal_id].extend(rows)
-                if len(relevant[deal_id]) > MAX_RELEVANT_ACTIVITIES:
+                if len(relevant[deal_id]) + len(rows) > MAX_RELEVANT_ACTIVITIES:
                     raise PilotError("Relevant activity protocol cap was exceeded")
+                hydrated, page_binding_only, binding_metrics = (
+                    _hydrate_activity_bindings(client, deal_id, rows)
+                )
+                binding_only += page_binding_only
+                relevant[deal_id].extend(hydrated)
+                binding_batch_supported = (
+                    binding_batch_supported
+                    and bool(binding_metrics["batch_supported"])
+                )
+                binding_batch_calls += int(binding_metrics["batch_calls"])
+                binding_direct_calls += int(binding_metrics["direct_calls"])
+                binding_pages += int(binding_metrics["pages"])
+                binding_rows += int(binding_metrics["rows"])
+                maximum_bindings = max(
+                    maximum_bindings,
+                    int(binding_metrics["maximum_for_one_activity"]),
+                )
                 if len(page) == ACTIVITY_PAGE_SIZE:
+                    if page_counts[deal_id] >= max_pages:
+                        raise PilotError("Activity page safety limit was reached")
                     if page_last <= last_ids[deal_id]:
                         raise PilotError("Activity keyset cursor did not advance")
                     last_ids[deal_id] = page_last
@@ -515,6 +840,12 @@ def list_activities_batched(
         "incoming_email_rows": email_count,
         "call_rows": call_count,
         "rows_found_only_through_binding": binding_only,
+        "batch_activity_binding_list_supported": binding_batch_supported,
+        "activity_binding_batch_calls": binding_batch_calls,
+        "activity_binding_direct_calls": binding_direct_calls,
+        "activity_binding_pages": binding_pages,
+        "activity_bindings_hydrated": binding_rows,
+        "maximum_bindings_for_one_activity": maximum_bindings,
         "binding_filter_verified": True,
         "keyset_pagination_verified": True,
     }
@@ -833,8 +1164,18 @@ def _private_write(path: Path, value: dict[str, object]) -> None:
 
 def _assert_aggregate_report(value: object) -> None:
     forbidden_keys = {
+        "activity_id",
+        "activityid",
+        "bindings",
         "comments",
+        "deal_id",
+        "dealid",
         "description",
+        "entity_id",
+        "entityid",
+        "id",
+        "owner_id",
+        "ownerid",
         "subject",
         "title",
         "transcription",

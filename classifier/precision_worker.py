@@ -27,6 +27,7 @@ from .precision_plan import (
     activity_kind,
     activity_locator_fingerprint,
     base_evidence_mode,
+    canonical_activity_bindings,
     canonical_activity_evidence,
     canonical_activity_index,
     canonical_deal_text_evidence,
@@ -46,6 +47,9 @@ STATE_SCHEMA_VERSION = 3
 MAX_UNCONFIRMED_ATTEMPTS = 3
 ACTIVITY_PAGE_SIZE = 50
 ACTIVITY_CONTENT_BATCH_SIZE = 20
+ACTIVITY_BINDING_BATCH_SIZE = 50
+MAX_ACTIVITY_BINDINGS = 100
+MAX_ACTIVITY_DISCOVERY_PAGES = 20
 MAX_ACTIVITY_ROWS_PER_WRITE = 5
 
 ACTIVITY_INDEX_FIELDS = [
@@ -63,7 +67,6 @@ ACTIVITY_INDEX_FIELDS = [
     "START_TIME",
     "END_TIME",
     "COMPLETED",
-    "BINDINGS",
 ]
 
 EXCLUDED_STAGE_NAMES = {
@@ -741,12 +744,217 @@ class PrecisionWorker:
     def _activity_rows(value: Any) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             value = value.get("activities")
-        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        if (
+            not isinstance(value, list)
+            or len(value) > ACTIVITY_PAGE_SIZE
+            or any(not isinstance(row, dict) for row in value)
+        ):
             raise ValueError("Bitrix24 вернул некорректный activity index")
         return value
 
+    @staticmethod
+    def _activity_binding_rows(value: Any) -> list[dict[str, Any]]:
+        if (
+            not isinstance(value, list)
+            or len(value) > ACTIVITY_PAGE_SIZE
+            or any(not isinstance(row, dict) for row in value)
+        ):
+            raise ValueError("Bitrix24 вернул некорректные bindings activity")
+        for row in value:
+            if (
+                set(row).intersection(
+                    {
+                        "OWNER_TYPE_ID",
+                        "ownerTypeId",
+                        "OWNER_ID",
+                        "ownerId",
+                    }
+                )
+                or not isinstance(row.get("entityTypeId"), int)
+                or isinstance(row.get("entityTypeId"), bool)
+                or not isinstance(row.get("entityId"), int)
+                or isinstance(row.get("entityId"), bool)
+                or int(row["entityTypeId"]) <= 0
+                or int(row["entityId"]) <= 0
+            ):
+                raise ValueError("Bitrix24 вернул некорректные bindings activity")
+        # The dedicated endpoint is authoritative. Validate its exact REST
+        # shape now; the canonical index will preserve the normalized values.
+        canonical_activity_bindings(value)
+        return value
+
+    @staticmethod
+    def _activity_binding_command(activity_id: object, start: int) -> str:
+        normalized_id = normalized(activity_id)
+        if (
+            not normalized_id.isdigit()
+            or int(normalized_id) <= 0
+            or start not in {0, ACTIVITY_PAGE_SIZE, MAX_ACTIVITY_BINDINGS}
+        ):
+            raise ValueError("Некорректный ID activity для bindings")
+        return "crm.activity.binding.list?" + urlencode(
+            [("activityId", normalized_id), ("start", str(start))]
+        )
+
+    def _fetch_activity_binding_page_direct(
+        self,
+        activity_id: object,
+        start: int,
+    ) -> list[dict[str, Any]]:
+        normalized_id = normalized(activity_id)
+        if (
+            not normalized_id.isdigit()
+            or int(normalized_id) <= 0
+            or start not in {0, ACTIVITY_PAGE_SIZE, MAX_ACTIVITY_BINDINGS}
+        ):
+            raise ValueError("Некорректный ID activity для bindings")
+        try:
+            value = self.call(
+                "crm.activity.binding.list",
+                {"activityId": normalized_id, "start": start},
+            )
+        except StopRequested:
+            raise
+        except Exception as exc:
+            raise ActivityEvidenceUnavailable(
+                transient=is_transient_error(exc)
+            ) from None
+        return self._activity_binding_rows(value)
+
+    def _fetch_activity_binding_pages_group(
+        self,
+        group: list[tuple[int, dict[str, Any]]],
+        start: int,
+    ) -> dict[int, list[dict[str, Any]]]:
+        commands = {
+            f"binding_{position}": self._activity_binding_command(
+                row.get("ID", row.get("id")),
+                start,
+            )
+            for position, row in group
+        }
+        fallback_all = False
+        try:
+            results, errors = self._activity_batch_parts(
+                self._activity_batch_call(commands)
+            )
+        except ActivityEvidenceUnavailable as exc:
+            if exc.split_batch and len(group) > 1:
+                midpoint = len(group) // 2
+                return {
+                    **self._fetch_activity_binding_pages_group(
+                        group[:midpoint], start
+                    ),
+                    **self._fetch_activity_binding_pages_group(
+                        group[midpoint:], start
+                    ),
+                }
+            if not exc.method_not_allowed:
+                raise
+            fallback_all = True
+            results, errors = {}, {}
+
+        expected_names = {f"binding_{position}" for position, _row in group}
+        if (
+            set(results).difference(expected_names)
+            or set(errors).difference(expected_names)
+        ):
+            raise ActivityEvidenceUnavailable(transient=False)
+
+        if errors and len(group) > 1 and any(
+            is_batch_timeout_error(str(value)) for value in errors.values()
+        ):
+            midpoint = len(group) // 2
+            return {
+                **self._fetch_activity_binding_pages_group(
+                    group[:midpoint], start
+                ),
+                **self._fetch_activity_binding_pages_group(
+                    group[midpoint:], start
+                ),
+            }
+
+        bindings: dict[int, list[dict[str, Any]]] = {}
+        for position, row in group:
+            name = f"binding_{position}"
+            if fallback_all or name in errors:
+                if not fallback_all and not self._activity_batch_error_is_method_not_allowed(
+                    errors[name]
+                ):
+                    raise ActivityEvidenceUnavailable(
+                        transient=is_transient_error(str(errors[name]))
+                    )
+                bindings[position] = self._fetch_activity_binding_page_direct(
+                    row.get("ID", row.get("id")),
+                    start,
+                )
+                continue
+            if name not in results:
+                raise ActivityEvidenceUnavailable(transient=False)
+            bindings[position] = self._activity_binding_rows(results[name])
+        return bindings
+
+    def _fetch_activity_bindings_group(
+        self,
+        group: list[tuple[int, dict[str, Any]]],
+    ) -> dict[int, list[dict[str, Any]]]:
+        bindings = self._fetch_activity_binding_pages_group(group, 0)
+        second_group = [
+            item for item in group
+            if len(bindings[item[0]]) == ACTIVITY_PAGE_SIZE
+        ]
+        if second_group:
+            second_pages = self._fetch_activity_binding_pages_group(
+                second_group,
+                ACTIVITY_PAGE_SIZE,
+            )
+            for position, _row in second_group:
+                bindings[position] = [
+                    *bindings[position],
+                    *second_pages[position],
+                ]
+        cap_group = [
+            item for item in second_group
+            if len(bindings[item[0]]) == MAX_ACTIVITY_BINDINGS
+        ]
+        if cap_group:
+            eof_pages = self._fetch_activity_binding_pages_group(
+                cap_group,
+                MAX_ACTIVITY_BINDINGS,
+            )
+            if any(eof_pages[position] for position, _row in cap_group):
+                raise ValueError("Превышен лимит bindings activity")
+        for value in bindings.values():
+            if len(canonical_activity_bindings(value)) != len(value):
+                raise ValueError("Bindings activity содержат дубликаты")
+        return bindings
+
+    def _hydrate_activity_bindings(
+        self,
+        deal_id: int,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+        fetched: dict[int, list[dict[str, Any]]] = {}
+        indexed_rows = list(enumerate(rows))
+        for group in chunks(indexed_rows, ACTIVITY_BINDING_BATCH_SIZE):
+            fetched.update(self._fetch_activity_bindings_group(group))
+        hydrated: list[dict[str, Any]] = []
+        for position, row in indexed_rows:
+            if position not in fetched:
+                raise ActivityEvidenceUnavailable(transient=False)
+            snapshot = dict(row)
+            snapshot["BINDINGS"] = fetched[position]
+            # This simultaneously verifies the dedicated endpoint included the
+            # requested deal binding and that all metadata remains canonical.
+            canonical_activity_index(deal_id, [snapshot])
+            hydrated.append(snapshot)
+        return hydrated
+
     def list_relevant_activities(self, deal_id: int) -> list[dict[str, Any]]:
         last_id = 0
+        pages = 0
         relevant: list[dict[str, Any]] = []
         while True:
             try:
@@ -771,7 +979,9 @@ class PrecisionWorker:
                     transient=is_transient_error(exc)
                 ) from None
             rows = self._activity_rows(result or [])
+            pages += 1
             page_last = last_id
+            page_relevant: list[dict[str, Any]] = []
             for row in rows:
                 raw_id = normalized(row.get("ID", row.get("id")))
                 if not raw_id.isdigit() or int(raw_id) <= page_last:
@@ -780,15 +990,16 @@ class PrecisionWorker:
                 kind = activity_kind(row)
                 if kind is None:
                     continue
-                try:
-                    canonical_activity_index(deal_id, [row])
-                except ValueError:
-                    raise ValueError("Relevant activity не прошла scope guard") from None
-                relevant.append(row)
-                if len(relevant) > MAX_RELEVANT_ACTIVITIES:
-                    raise ValueError("Превышен лимит relevant activities")
+                page_relevant.append(row)
+            if len(relevant) + len(page_relevant) > MAX_RELEVANT_ACTIVITIES:
+                raise ValueError("Превышен лимит relevant activities")
+            relevant.extend(
+                self._hydrate_activity_bindings(deal_id, page_relevant)
+            )
             if len(rows) < ACTIVITY_PAGE_SIZE:
                 break
+            if pages >= MAX_ACTIVITY_DISCOVERY_PAGES:
+                raise ValueError("Превышен лимит страниц activity index")
             if page_last <= last_id:
                 raise ValueError("Activity index не продвинул keyset cursor")
             last_id = page_last
@@ -819,6 +1030,7 @@ class PrecisionWorker:
         }
         failures: dict[int, ActivityEvidenceUnavailable | ValueError] = {}
         last_ids = {deal_id: 0 for deal_id in pending}
+        page_counts = {deal_id: 0 for deal_id in pending}
         while pending:
             next_pending: list[int] = []
             for group in chunks(pending, 50):
@@ -883,7 +1095,9 @@ class PrecisionWorker:
                         continue
                     try:
                         rows = self._activity_rows(results[command_name])
+                        page_counts[deal_id] += 1
                         page_last = last_ids[deal_id]
+                        page_relevant: list[dict[str, Any]] = []
                         for row in rows:
                             raw_id = normalized(row.get("ID", row.get("id")))
                             if not raw_id.isdigit() or int(raw_id) <= page_last:
@@ -893,19 +1107,34 @@ class PrecisionWorker:
                             page_last = int(raw_id)
                             if activity_kind(row) is None:
                                 continue
-                            canonical_activity_index(deal_id, [row])
-                            relevant[deal_id].append(row)
-                            if len(relevant[deal_id]) > MAX_RELEVANT_ACTIVITIES:
-                                raise ValueError(
-                                    "Превышен лимит relevant activities"
-                                )
+                            page_relevant.append(row)
+                        if (
+                            len(relevant[deal_id]) + len(page_relevant)
+                            > MAX_RELEVANT_ACTIVITIES
+                        ):
+                            raise ValueError(
+                                "Превышен лимит relevant activities"
+                            )
+                        relevant[deal_id].extend(
+                            self._hydrate_activity_bindings(
+                                deal_id,
+                                page_relevant,
+                            )
+                        )
                         if len(rows) == ACTIVITY_PAGE_SIZE:
+                            if page_counts[deal_id] >= MAX_ACTIVITY_DISCOVERY_PAGES:
+                                raise ValueError(
+                                    "Превышен лимит страниц activity index"
+                                )
                             if page_last <= last_ids[deal_id]:
                                 raise ValueError(
                                     "Activity index не продвинул keyset cursor"
                                 )
                             last_ids[deal_id] = page_last
                             next_pending.append(deal_id)
+                    except ActivityEvidenceUnavailable as exc:
+                        failures[deal_id] = exc
+                        relevant.pop(deal_id, None)
                     except ValueError:
                         failures[deal_id] = ValueError(
                             "Некорректный activity index"

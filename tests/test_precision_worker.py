@@ -37,10 +37,12 @@ from classifier.precision_plan import (
     transition_fingerprint,
 )
 from classifier.precision_worker import (
+    ACTIVITY_PAGE_SIZE,
     ActivityEvidenceUnavailable,
     CATEGORY_FIELD,
     SUBCATEGORY_FIELD,
     EXCLUDED_STAGE_NAMES,
+    MAX_ACTIVITY_DISCOVERY_PAGES,
     MAX_UNCONFIRMED_ATTEMPTS,
     PermanentWorkerError,
     PrecisionWorker,
@@ -333,6 +335,44 @@ class ActivityRuntimeBitrix:
         self.calls = []
         self.activity_list_count = 0
         self.update_commands = []
+        self.bindings = {}
+        index_rows = [
+            item for page in self.activity_indexes for item in page
+        ]
+        for row in [*self.details.values(), *index_rows]:
+            if isinstance(row, dict) and row.get("ID") is not None:
+                self._remember_bindings(row)
+
+    def _remember_bindings(self, row):
+        values = row.get("BINDINGS", row.get("bindings", []))
+        if not isinstance(values, list):
+            return
+        converted = []
+        for binding in values:
+            if not isinstance(binding, dict):
+                continue
+            entity_type = binding.get(
+                "entityTypeId",
+                binding.get("OWNER_TYPE_ID", binding.get("ownerTypeId")),
+            )
+            entity_id = binding.get(
+                "entityId",
+                binding.get("OWNER_ID", binding.get("ownerId")),
+            )
+            if entity_type is not None and entity_id is not None:
+                converted.append(
+                    {"entityTypeId": int(entity_type), "entityId": int(entity_id)}
+                )
+        self.bindings[str(row["ID"])] = converted
+
+    def _activity_page(self, version, last_id):
+        for row in version:
+            self._remember_bindings(row)
+        return [
+            {key: value for key, value in row.items() if key != "BINDINGS"}
+            for row in version
+            if int(row["ID"]) > last_id
+        ][:50]
 
     def _deal_rows(self, deal_ids):
         rows = []
@@ -368,9 +408,11 @@ class ActivityRuntimeBitrix:
             ]
             self.activity_list_count += 1
             last_id = int(params["filter"][">ID"])
-            return [
-                row for row in version if int(row["ID"]) > last_id
-            ][:50]
+            return self._activity_page(version, last_id)
+        if method == "crm.activity.binding.list":
+            activity_id = str(params["activityId"])
+            start = int(params["start"])
+            return self.bindings.get(activity_id, [])[start:start + 50]
         if method == "crm.activity.call.getTranscript":
             return self.transcripts.get(str(params["activityId"]))
         if method == "batch":
@@ -384,9 +426,15 @@ class ActivityRuntimeBitrix:
                     ]
                     self.activity_list_count += 1
                     last_id = int(values["filter[>ID]"][0])
-                    results[name] = [
-                        row for row in version if int(row["ID"]) > last_id
-                    ][:50]
+                    results[name] = self._activity_page(version, last_id)
+                elif command.startswith("crm.activity.binding.list?"):
+                    activity_id = self._command_id(command)
+                    start = int(
+                        parse_qs(urlsplit(command).query).get("start", ["0"])[0]
+                    )
+                    results[name] = self.bindings.get(activity_id, [])[
+                        start:start + 50
+                    ]
                 elif command.startswith("crm.activity.get?"):
                     activity_id = self._command_id(command)
                     if activity_id in self.detail_errors:
@@ -2870,17 +2918,58 @@ class PrecisionWorkerTests(unittest.TestCase):
                 if method == "batch":
                     results = {}
                     for name, command in params["cmd"].items():
+                        if command.startswith("crm.activity.binding.list?"):
+                            values = parse_qs(urlsplit(command).query)
+                            activity_id = values["activityId"][0]
+                            start = int(values["start"][0])
+                            row = next(
+                                item for item in rows
+                                if item["ID"] == activity_id
+                            )
+                            results[name] = [
+                                {
+                                    "entityTypeId": int(binding["OWNER_TYPE_ID"]),
+                                    "entityId": int(binding["OWNER_ID"]),
+                                }
+                                for binding in row["BINDINGS"]
+                            ][start:start + 50]
+                            continue
                         values = parse_qs(urlsplit(command).query)
                         if values.get("start") != ["0"]:
                             raise AssertionError("offset pagination is forbidden")
                         last_id = int(values["filter[>ID]"][0])
                         results[name] = [
-                            row for row in rows if int(row["ID"]) > last_id
+                            {
+                                key: value
+                                for key, value in row.items()
+                                if key != "BINDINGS"
+                            }
+                            for row in rows if int(row["ID"]) > last_id
                         ][:50]
                     return {"result": results, "result_error": {}}
+                if method == "crm.activity.binding.list":
+                    row = next(
+                        item for item in rows
+                        if item["ID"] == str(params["activityId"])
+                    )
+                    start = int(params["start"])
+                    return [
+                        {
+                            "entityTypeId": int(binding["OWNER_TYPE_ID"]),
+                            "entityId": int(binding["OWNER_ID"]),
+                        }
+                        for binding in row["BINDINGS"]
+                    ][start:start + 50]
                 self.assert_params(params)
                 last_id = int(params["filter"][">ID"])
-                return [row for row in rows if int(row["ID"]) > last_id][:50]
+                return [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "BINDINGS"
+                    }
+                    for row in rows if int(row["ID"]) > last_id
+                ][:50]
 
             @staticmethod
             def assert_params(params):
@@ -2901,7 +2990,11 @@ class PrecisionWorkerTests(unittest.TestCase):
                 found = worker.list_relevant_activities(1)
                 self.assertEqual([int(row["ID"]) for row in found], list(range(1, 101)))
                 self.assertEqual(
-                    [call[1]["filter"][">ID"] for call in bitrix.calls],
+                    [
+                        call[1]["filter"][">ID"]
+                        for call in bitrix.calls
+                        if call[0] == "crm.activity.list"
+                    ],
                     [0, 50, 100],
                 )
                 self.assertTrue(all(row["OWNER_TYPE_ID"] == "3" for row in found))
@@ -2910,6 +3003,183 @@ class PrecisionWorkerTests(unittest.TestCase):
                 self.assertEqual(
                     [int(row["ID"]) for row in batched[1]],
                     list(range(1, 101)),
+                )
+            finally:
+                state.close()
+
+    def test_activity_binding_hydration_reads_all_pages_and_explicit_eof(self):
+        index_row = activity_row(7001, deal_id=1)
+        index_row.pop("BINDINGS")
+        all_bindings = [
+            {"entityTypeId": 2, "entityId": 1},
+            *(
+                {"entityTypeId": 3, "entityId": value}
+                for value in range(1, 100)
+            ),
+        ]
+
+        class PagedBindingBitrix:
+            def __init__(self, *, direct_fallback=False, values=None):
+                self.direct_fallback = direct_fallback
+                self.values = list(values if values is not None else all_bindings)
+                self.batch_starts = []
+                self.direct_starts = []
+
+            def call(self, method, params=None):
+                params = params or {}
+                if method == "batch":
+                    results = {}
+                    errors = {}
+                    for name, command in params["cmd"].items():
+                        parsed = urlsplit(command)
+                        if parsed.path != "crm.activity.binding.list":
+                            raise AssertionError(f"unexpected command: {command}")
+                        values = parse_qs(parsed.query)
+                        start = int(values["start"][0])
+                        self.batch_starts.append(start)
+                        if self.direct_fallback:
+                            errors[name] = {
+                                "error": "ERROR_BATCH_METHOD_NOT_ALLOWED"
+                            }
+                        else:
+                            results[name] = self.values[start:start + 50]
+                    return {
+                        "result": results,
+                        # The live portal returns an empty list on success.
+                        "result_error": errors if errors else [],
+                    }
+                if method == "crm.activity.binding.list":
+                    start = int(params["start"])
+                    self.direct_starts.append(start)
+                    return self.values[start:start + 50]
+                raise AssertionError(f"unexpected method: {method}")
+
+        for direct_fallback in (False, True):
+            with self.subTest(
+                direct_fallback=direct_fallback
+            ), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    bitrix = PagedBindingBitrix(
+                        direct_fallback=direct_fallback
+                    )
+                    worker = make_worker(state, bitrix, directory)
+                    hydrated = worker._hydrate_activity_bindings(1, [index_row])
+                    self.assertEqual(len(hydrated[0]["BINDINGS"]), 100)
+                    self.assertEqual(bitrix.batch_starts, [0, 50, 100])
+                    self.assertEqual(
+                        bitrix.direct_starts,
+                        [0, 50, 100] if direct_fallback else [],
+                    )
+                finally:
+                    state.close()
+
+        invalid_values = (
+            (
+                "overflow",
+                [*all_bindings, {"entityTypeId": 4, "entityId": 999}],
+                ValueError,
+            ),
+            (
+                "cross-page-duplicate",
+                [*all_bindings[:-1], all_bindings[0]],
+                ValueError,
+            ),
+            (
+                "non-positive",
+                [{"entityTypeId": 2, "entityId": 0}],
+                ValueError,
+            ),
+            (
+                "conflicting-alias",
+                [
+                    {
+                        "entityTypeId": 2,
+                        "entityId": 1,
+                        "OWNER_ID": 2,
+                    }
+                ],
+                ValueError,
+            ),
+        )
+        for name, values, expected_error in invalid_values:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                state = State(Path(directory) / "worker.sqlite3")
+                try:
+                    worker = make_worker(
+                        state,
+                        PagedBindingBitrix(values=values),
+                        directory,
+                    )
+                    with self.assertRaises(expected_error):
+                        worker._hydrate_activity_bindings(1, [index_row])
+                finally:
+                    state.close()
+
+    def test_activity_discovery_page_cap_applies_to_direct_and_batch(self):
+        rows = []
+        for activity_id in range(1, MAX_ACTIVITY_DISCOVERY_PAGES * 50 + 1):
+            row = activity_row(activity_id, deal_id=1)
+            row["DIRECTION"] = "2"
+            row.pop("BINDINGS")
+            rows.append(row)
+
+        class EndlessUnsupportedBitrix:
+            def __init__(self):
+                self.direct_calls = 0
+                self.batch_calls = 0
+
+            def call(self, method, params=None):
+                params = params or {}
+                if method == "crm.activity.list":
+                    self.direct_calls += 1
+                    last_id = int(params["filter"][">ID"])
+                    return [row for row in rows if int(row["ID"]) > last_id][
+                        :ACTIVITY_PAGE_SIZE
+                    ]
+                if method == "batch":
+                    self.batch_calls += 1
+                    results = {}
+                    for name, command in params["cmd"].items():
+                        parsed = urlsplit(command)
+                        if parsed.path != "crm.activity.list":
+                            raise AssertionError(f"unexpected command: {command}")
+                        values = parse_qs(parsed.query)
+                        last_id = int(values["filter[>ID]"][0])
+                        results[name] = [
+                            row for row in rows if int(row["ID"]) > last_id
+                        ][:ACTIVITY_PAGE_SIZE]
+                    return {"result": results, "result_error": []}
+                raise AssertionError(f"unexpected method: {method}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                direct_bitrix = EndlessUnsupportedBitrix()
+                direct_worker = make_worker(
+                    state,
+                    direct_bitrix,
+                    directory,
+                )
+                with self.assertRaisesRegex(ValueError, "страниц"):
+                    direct_worker.list_relevant_activities(1)
+                self.assertEqual(
+                    direct_bitrix.direct_calls,
+                    MAX_ACTIVITY_DISCOVERY_PAGES,
+                )
+
+                batch_bitrix = EndlessUnsupportedBitrix()
+                batch_worker = make_worker(
+                    state,
+                    batch_bitrix,
+                    directory,
+                )
+                found, failures = batch_worker.list_relevant_activities_many([1])
+                self.assertEqual(found, {})
+                self.assertIsInstance(failures[1], ValueError)
+                self.assertEqual(
+                    batch_bitrix.batch_calls,
+                    MAX_ACTIVITY_DISCOVERY_PAGES,
                 )
             finally:
                 state.close()
@@ -3206,6 +3476,115 @@ class PrecisionWorkerTests(unittest.TestCase):
             finally:
                 state.close()
 
+    def test_final_activity_binding_error_isolated_to_one_deal(self):
+        selected_by_deal = {
+            deal_id: activity_row(600 + deal_id, deal_id=deal_id)
+            for deal_id in (1, 2)
+        }
+        records = []
+        for deal_id, selected in selected_by_deal.items():
+            records.append(
+                (
+                    deal_id,
+                    ("cat-old", "sub-old"),
+                    ("cat-new", "sub-new"),
+                    "activities",
+                    canonical_activity_evidence(
+                        deal_id, [selected], [selected]
+                    ),
+                    activity_index_guard_fingerprint(
+                        TEST_KEY,
+                        deal_id,
+                        canonical_activity_index(deal_id, [selected]),
+                    ),
+                    [
+                        activity_locator_fingerprint(
+                            TEST_KEY, deal_id, "email", selected["ID"]
+                        )
+                    ],
+                )
+            )
+        plan = approved_plan(records)
+
+        class IsolatedBindingFailureBitrix(ActivityRuntimeBitrix):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.binding_batches = 0
+
+            def call(self, method, params=None):
+                params = params or {}
+                commands = params.get("cmd", {})
+                if method == "crm.activity.list":
+                    self.calls.append((method, params))
+                    deal_id = int(params["filter"]["BINDINGS"][0]["OWNER_ID"])
+                    return self._activity_page(
+                        [selected_by_deal[deal_id]],
+                        int(params["filter"][">ID"]),
+                    )
+                if method == "batch" and commands and all(
+                    command.startswith("crm.activity.list?")
+                    for command in commands.values()
+                ):
+                    self.calls.append((method, params))
+                    results = {}
+                    for name, command in commands.items():
+                        values = parse_qs(urlsplit(command).query)
+                        deal_id = int(
+                            values["filter[BINDINGS][0][OWNER_ID]"][0]
+                        )
+                        results[name] = self._activity_page(
+                            [selected_by_deal[deal_id]],
+                            int(values["filter[>ID]"][0]),
+                        )
+                    return {"result": results, "result_error": []}
+                if method == "batch" and commands and all(
+                    command.startswith("crm.activity.binding.list?")
+                    for command in commands.values()
+                ):
+                    self.binding_batches += 1
+                    if self.binding_batches == 5:
+                        self.calls.append((method, params))
+                        return {
+                            "result": {},
+                            "result_error": {
+                                next(iter(commands)): {
+                                    "error": "ACCESS_DENIED"
+                                }
+                            },
+                        }
+                return super().call(method, params)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = State(Path(directory) / "worker.sqlite3")
+            try:
+                enqueue(state, 1, evidence_mode="activities")
+                enqueue(state, 2, evidence_mode="activities")
+                bitrix = IsolatedBindingFailureBitrix(
+                    live={
+                        1: ("cat-old", "sub-old", "NEW", "", ""),
+                        2: ("cat-old", "sub-old", "NEW", "", ""),
+                    },
+                    activity_indexes=[[]],
+                    details={
+                        selected["ID"]: selected
+                        for selected in selected_by_deal.values()
+                    },
+                )
+                worker = make_worker(state, bitrix, directory, plan=plan)
+                worker.metadata_resolved_at = time.time()
+                with patch.object(worker, "wait_for_write_slot"), patch.object(
+                    worker, "sleep"
+                ):
+                    worker.process_one_batch()
+                self.assertEqual(
+                    state.counts(),
+                    {"permanent_error": 1, "verified": 1},
+                )
+                self.assertEqual(len(bitrix.update_commands), 1)
+                self.assertIn("id=2", bitrix.update_commands[0])
+            finally:
+                state.close()
+
     def test_activity_body_or_index_race_causes_conflict_without_write(self):
         selected = activity_row(501, deal_id=1)
         changed_body = dict(selected)
@@ -3215,11 +3594,22 @@ class PrecisionWorkerTests(unittest.TestCase):
             {"OWNER_TYPE_ID": "3", "OWNER_ID": "77"},
             {"OWNER_TYPE_ID": "2", "OWNER_ID": "999"},
         ]
+        rebound_index = dict(selected)
+        rebound_index["BINDINGS"] = [
+            {"OWNER_TYPE_ID": "3", "OWNER_ID": "77"},
+            {"OWNER_TYPE_ID": "2", "OWNER_ID": "999"},
+        ]
         changed_index = dict(selected)
         changed_index["SUBJECT"] += " changed"
         cases = (
             ("body", [[selected]], changed_body),
             ("get-binding", [[selected]], changed_binding),
+            ("binding-between-a-b", [[selected], [rebound_index]], selected),
+            (
+                "binding-after-b",
+                [[selected], [selected], [rebound_index]],
+                selected,
+            ),
             ("index-between-a-b", [[selected], [changed_index]], selected),
             (
                 "index-after-b",
