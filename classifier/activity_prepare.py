@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 
 from .ai import _output_text
@@ -38,6 +39,7 @@ from .precision_worker import (
     MAX_ACTIVITY_DISCOVERY_PAGES,
     SUBCATEGORY_FIELD,
     is_batch_timeout_error,
+    is_quota_error,
     is_transient_error,
     normalize_stage_name,
     normalize_taxonomy_label,
@@ -50,6 +52,52 @@ DEFAULT_PARENT_MAP = Path(__file__).with_name("data") / "precision-2025-parent-m
 MAX_CLASSIFIER_ACTIVITY_CHARS = 16_000
 MAX_CLASSIFIER_TOTAL_CHARS = 96_000
 MAX_OPENAI_ATTEMPTS = 3
+DIAGNOSTIC_FORMAT = "bitrix24-activity-preparation-diagnostic-v1"
+DIAGNOSTIC_STAGES = frozenset(
+    {
+        "bootstrap",
+        "resolve_excluded_stages",
+        "resolve_live_fields",
+        "load_taxonomy",
+        "model_canary",
+        "scan_deals",
+        "activity_discovery",
+        "activity_content",
+        "model_classification",
+        "final_guard",
+        "persist_outputs",
+        "complete",
+    }
+)
+DIAGNOSTIC_FAILURE_CODES = frozenset(
+    {
+        "none",
+        "configuration_invalid",
+        "private_path_invalid",
+        "bitrix_request_rejected",
+        "bitrix_request_transient",
+        "bitrix_rate_limited",
+        "bitrix_timeout",
+        "bitrix_response_invalid",
+        "taxonomy_invalid",
+        "checkpoint_invalid",
+        "api_call_cap",
+        "model_request_rejected",
+        "model_request_transient",
+        "model_auth_rejected",
+        "model_request_invalid",
+        "model_not_found",
+        "model_rate_limited",
+        "model_timeout",
+        "model_server_error",
+        "model_transport_error",
+        "model_response_invalid",
+        "no_safe_rows",
+        "private_state_io",
+        "unexpected_deferred_evidence",
+        "unexpected_error",
+    }
+)
 ALLOWED_NON_TARGET_REASONS = {
     "supplier",
     "spam",
@@ -67,10 +115,35 @@ class PreparationError(RuntimeError):
     pass
 
 
+class CodedPreparationError(PreparationError):
+    def __init__(self, message: str, *, failure_code: str):
+        super().__init__(message)
+        if failure_code not in DIAGNOSTIC_FAILURE_CODES or failure_code == "none":
+            raise ValueError("Некорректный diagnostic failure code")
+        self.failure_code = failure_code
+
+
 class TransientPreparationError(PreparationError):
-    def __init__(self, message: str, *, batch_timeout: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        batch_timeout: bool = False,
+        service: str = "bitrix",
+        failure_code: str | None = None,
+    ):
         super().__init__(message)
         self.batch_timeout = bool(batch_timeout)
+        if service not in {"bitrix", "model"}:
+            raise ValueError("Некорректный transient service")
+        self.service = service
+        self.failure_code = failure_code or (
+            "model_request_transient"
+            if service == "model"
+            else "bitrix_request_transient"
+        )
+        if self.failure_code not in DIAGNOSTIC_FAILURE_CODES:
+            raise ValueError("Некорректный transient failure code")
 
 
 class DeferredEvidence(PreparationError):
@@ -247,6 +320,123 @@ class PreparationStats:
         return dict(sorted(self.__dict__.items()))
 
 
+def diagnostic_failure_code(exc: BaseException, *, stage: str) -> str:
+    """Map a failure to a stable, non-sensitive public diagnostic code."""
+
+    if isinstance(exc, CodedPreparationError):
+        return exc.failure_code
+    if isinstance(exc, TransientPreparationError):
+        return exc.failure_code
+    if isinstance(exc, DeferredEvidence):
+        return "unexpected_deferred_evidence"
+    if isinstance(exc, PreparationError):
+        if stage in {
+            "resolve_excluded_stages",
+            "resolve_live_fields",
+            "scan_deals",
+        }:
+            return "bitrix_response_invalid"
+        if stage == "load_taxonomy":
+            return "taxonomy_invalid"
+        return "unexpected_error"
+    if isinstance(exc, OSError) and stage in {"bootstrap", "persist_outputs"}:
+        return "private_state_io"
+    if stage == "load_taxonomy":
+        return "taxonomy_invalid"
+    if stage in {
+        "resolve_excluded_stages",
+        "resolve_live_fields",
+        "scan_deals",
+        "activity_discovery",
+        "activity_content",
+        "final_guard",
+    }:
+        return "bitrix_request_rejected"
+    return "unexpected_error"
+
+
+class SafePreparationDiagnostics:
+    """Persist only stable enums and aggregate counters in runner temp.
+
+    Raw deal IDs, activity IDs, titles, bodies, transcripts, exception strings,
+    API descriptions, and credentials are deliberately outside this schema.
+    """
+
+    def __init__(self, path: Path, stats: PreparationStats):
+        require_private_path(path)
+        self.path = path
+        self.stats = stats
+        self.stage = "bootstrap"
+        self.taxonomy: LiveTaxonomy | None = None
+        self.bitrix: Any | None = None
+
+    def attach(
+        self,
+        *,
+        taxonomy: LiveTaxonomy | None = None,
+        bitrix: Any | None = None,
+    ) -> None:
+        if taxonomy is not None:
+            self.taxonomy = taxonomy
+        if bitrix is not None:
+            self.bitrix = bitrix
+
+    def _refresh_api_counts(self) -> None:
+        if self.bitrix is None:
+            return
+        self.stats.bitrix_api_calls = max(
+            self.stats.bitrix_api_calls,
+            int(getattr(self.bitrix, "call_count", 0)),
+        )
+        self.stats.bitrix_api_call_cap = int(
+            getattr(self.bitrix, "call_cap", self.stats.bitrix_api_call_cap)
+        )
+
+    def _write(self, *, outcome: str, failure_code: str) -> None:
+        if self.stage not in DIAGNOSTIC_STAGES:
+            raise ValueError("Некорректный diagnostic stage")
+        if outcome not in {"running", "failure", "success"}:
+            raise ValueError("Некорректный diagnostic outcome")
+        if failure_code not in DIAGNOSTIC_FAILURE_CODES:
+            raise ValueError("Некорректный diagnostic failure code")
+        if outcome == "failure" and failure_code == "none":
+            raise ValueError("Failure diagnostics require a failure code")
+        if outcome != "failure" and failure_code != "none":
+            raise ValueError("Non-failure diagnostics cannot contain a failure code")
+        self._refresh_api_counts()
+        taxonomy = self.taxonomy
+        atomic_private_json(
+            self.path,
+            {
+                "format": DIAGNOSTIC_FORMAT,
+                "outcome": outcome,
+                "failure_stage": self.stage,
+                "failure_code": failure_code,
+                "stats": self.stats.as_dict(),
+                "taxonomy": {
+                    "categories": len(taxonomy.categories) if taxonomy else 0,
+                    "subcategories": len(taxonomy.subcategories) if taxonomy else 0,
+                    "pairs": len(taxonomy.pairs) if taxonomy else 0,
+                },
+            },
+        )
+
+    def enter(self, stage: str) -> None:
+        if stage not in DIAGNOSTIC_STAGES:
+            raise ValueError("Некорректный diagnostic stage")
+        self.stage = stage
+        self._write(outcome="running", failure_code="none")
+
+    def fail(self, exc: BaseException) -> str:
+        failure_code = diagnostic_failure_code(exc, stage=self.stage)
+        self._write(outcome="failure", failure_code=failure_code)
+        return failure_code
+
+    def succeed(self) -> None:
+        self.stage = "complete"
+        self._write(outcome="success", failure_code="none")
+
+
 def preparation_scope_digest(
     deals: list[DealSnapshot],
     *,
@@ -362,8 +552,9 @@ class ReliableBitrix:
 
     def ensure_capacity(self, additional_calls: int) -> None:
         if self.call_count + max(0, int(additional_calls)) > self.call_cap:
-            raise PreparationError(
-                "Projected Bitrix API calls exceed the hosted preparation cap"
+            raise CodedPreparationError(
+                "Projected Bitrix API calls exceed the hosted preparation cap",
+                failure_code="api_call_cap",
             )
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
@@ -379,12 +570,28 @@ class ReliableBitrix:
             except Exception as exc:
                 if not is_transient_error(exc):
                     raise
+                quota_error = is_quota_error(exc)
+                timeout_error = is_batch_timeout_error(exc)
                 if attempt == self.attempts:
                     raise TransientPreparationError(
                         f"Временная ошибка Bitrix24: {method}",
-                        batch_timeout=is_batch_timeout_error(exc),
+                        batch_timeout=timeout_error,
+                        service="bitrix",
+                        failure_code=(
+                            "bitrix_rate_limited"
+                            if quota_error
+                            else (
+                                "bitrix_timeout"
+                                if timeout_error
+                                else "bitrix_request_transient"
+                            )
+                        ),
                     ) from None
-                self.sleeper(min(60.0, 2.0 ** attempt))
+                self.sleeper(
+                    min(900.0, 180.0 * (2 ** (attempt - 1)))
+                    if quota_error
+                    else min(60.0, 2.0 ** attempt)
+                )
         raise AssertionError("unreachable")
 
 
@@ -1702,6 +1909,32 @@ class ModelDecision:
     ambiguous_or_mixed: bool
 
 
+def model_request_failure_code(exc: BaseException) -> str:
+    """Classify model transport failures without inspecting response bodies."""
+
+    if isinstance(exc, HTTPError):
+        if exc.code in {401, 403}:
+            return "model_auth_rejected"
+        if exc.code == 404:
+            return "model_not_found"
+        if exc.code == 408:
+            return "model_timeout"
+        if exc.code == 409:
+            return "model_request_transient"
+        if exc.code == 429:
+            return "model_rate_limited"
+        if 500 <= exc.code < 600:
+            return "model_server_error"
+        return "model_request_invalid"
+    if isinstance(exc, TimeoutError) or is_batch_timeout_error(exc):
+        return "model_timeout"
+    if is_quota_error(exc):
+        return "model_rate_limited"
+    if isinstance(exc, URLError):
+        return "model_transport_error"
+    return "model_transport_error"
+
+
 class OpenAIActivityClassifier:
     def __init__(
         self,
@@ -1757,6 +1990,99 @@ class OpenAIActivityClassifier:
             "additionalProperties": False,
         }
 
+    def _request_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        for attempt in range(1, MAX_OPENAI_ATTEMPTS + 1):
+            try:
+                response = self.requester(
+                    "https://api.openai.com/v1/responses",
+                    payload,
+                    {"Authorization": f"Bearer {self.api_key}"},
+                    self.timeout,
+                )
+                if not isinstance(response, dict):
+                    raise CodedPreparationError(
+                        "OpenAI structured response has an invalid envelope",
+                        failure_code="model_response_invalid",
+                    )
+                return response
+            except CodedPreparationError:
+                raise
+            except Exception as exc:
+                failure_code = model_request_failure_code(exc)
+                if not is_transient_error(exc):
+                    raise CodedPreparationError(
+                        "OpenAI structured classification request was rejected",
+                        failure_code=failure_code,
+                    ) from None
+                if attempt == MAX_OPENAI_ATTEMPTS:
+                    raise TransientPreparationError(
+                        "OpenAI structured classification failed",
+                        service="model",
+                        failure_code=failure_code,
+                    ) from None
+                self.sleeper(
+                    min(120.0, 30.0 * (2 ** (attempt - 1)))
+                    if failure_code == "model_rate_limited"
+                    else 2.0 ** attempt
+                )
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _canary_value() -> dict[str, Any]:
+        return {
+            "qualified_product_request": False,
+            "non_target_reason": "none",
+            "category_id": None,
+            "subcategory_id": None,
+            "category_only": False,
+            "selected_activity_aliases": [],
+            "ambiguous_or_mixed": True,
+            "product_terms": [],
+        }
+
+    def canary(self) -> None:
+        """Verify the exact production schema without any CRM evidence."""
+
+        expected = self._canary_value()
+        payload = {
+            "model": self.model,
+            "store": False,
+            "input": (
+                "Synthetic configuration canary. No customer or CRM data is present. "
+                "Return exactly this JSON object: "
+                + json.dumps(expected, separators=(",", ":"))
+            ),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "activity_preparation_canary",
+                    "strict": True,
+                    "schema": self._schema(),
+                }
+            },
+        }
+        try:
+            value = json.loads(_output_text(self._request_response(payload)))
+        except CodedPreparationError:
+            raise
+        except (
+            AttributeError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            raise CodedPreparationError(
+                "OpenAI Structured Outputs canary response was invalid",
+                failure_code="model_response_invalid",
+            ) from None
+        if value != expected:
+            raise CodedPreparationError(
+                "OpenAI Structured Outputs canary response was invalid",
+                failure_code="model_response_invalid",
+            )
+
     def _one_pass(
         self,
         blocks: list[ClassifierBlock],
@@ -1807,24 +2133,7 @@ class OpenAIActivityClassifier:
                 }
             },
         }
-        response: dict[str, Any] | None = None
-        for attempt in range(1, MAX_OPENAI_ATTEMPTS + 1):
-            try:
-                response = self.requester(
-                    "https://api.openai.com/v1/responses",
-                    payload,
-                    {"Authorization": f"Bearer {self.api_key}"},
-                    self.timeout,
-                )
-                break
-            except Exception as exc:
-                if not is_transient_error(exc) or attempt == MAX_OPENAI_ATTEMPTS:
-                    raise TransientPreparationError(
-                        "OpenAI structured classification failed"
-                    ) from None
-                self.sleeper(2.0 ** attempt)
-        if response is None:
-            raise AssertionError("unreachable")
+        response = self._request_response(payload)
         try:
             value = json.loads(_output_text(response))
             expected_keys = {
@@ -1896,7 +2205,10 @@ class OpenAIActivityClassifier:
             ValueError,
             json.JSONDecodeError,
         ):
-            raise DeferredEvidence("ambiguous") from None
+            raise CodedPreparationError(
+                "OpenAI structured classification response was invalid",
+                failure_code="model_response_invalid",
+            ) from None
 
     @staticmethod
     def _accepted(
@@ -2010,6 +2322,7 @@ class ActivityPreparationPipeline:
         scope_digest: str,
         model_workers: int = 5,
         stats: PreparationStats | None = None,
+        progress: Callable[[str], None] | None = None,
     ):
         self.bitrix = bitrix
         self.collector = collector
@@ -2023,13 +2336,33 @@ class ActivityPreparationPipeline:
         self.scope_digest = scope_digest
         self.model_workers = min(5, max(1, int(model_workers)))
         self.stats = stats or PreparationStats()
+        self.progress = progress
         self.plan_rows: list[dict[str, Any]] = []
         self.processed_ids: set[int] = set()
+
+    def _enter_stage(self, stage: str) -> None:
+        self.stats.bitrix_api_calls = max(
+            self.stats.bitrix_api_calls,
+            int(getattr(self.bitrix, "call_count", 0)),
+        )
+        if self.progress is not None:
+            self.progress(stage)
 
     def load_checkpoint(self) -> None:
         if not self.checkpoint_path.exists():
             return
-        payload = read_private_json(self.checkpoint_path)
+        try:
+            payload = read_private_json(self.checkpoint_path)
+        except OSError as exc:
+            raise CodedPreparationError(
+                "Не удалось прочитать private checkpoint",
+                failure_code="private_state_io",
+            ) from exc
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CodedPreparationError(
+                "Некорректный checkpoint",
+                failure_code="checkpoint_invalid",
+            ) from exc
         if (
             not isinstance(payload, dict)
             or payload.get("format") != "bitrix24-activity-preparation-checkpoint-v1"
@@ -2054,18 +2387,24 @@ class ActivityPreparationPipeline:
                 setattr(self.stats, key, int(stats[key]))
 
     def save_checkpoint(self) -> None:
-        atomic_private_json(
-            self.checkpoint_path,
-            {
-                "format": "bitrix24-activity-preparation-checkpoint-v1",
-                "year": self.year,
-                "taxonomy_digest": self.taxonomy.digest,
-                "scope_digest": self.scope_digest,
-                "processed_ids": sorted(self.processed_ids),
-                "plan_rows": self.plan_rows,
-                "stats": self.stats.as_dict(),
-            },
-        )
+        try:
+            atomic_private_json(
+                self.checkpoint_path,
+                {
+                    "format": "bitrix24-activity-preparation-checkpoint-v1",
+                    "year": self.year,
+                    "taxonomy_digest": self.taxonomy.digest,
+                    "scope_digest": self.scope_digest,
+                    "processed_ids": sorted(self.processed_ids),
+                    "plan_rows": self.plan_rows,
+                    "stats": self.stats.as_dict(),
+                },
+            )
+        except OSError as exc:
+            raise CodedPreparationError(
+                "Не удалось сохранить private checkpoint",
+                failure_code="private_state_io",
+            ) from exc
 
     def _defer(self, reason: str) -> None:
         if reason in {
@@ -2221,6 +2560,7 @@ class ActivityPreparationPipeline:
             ]
             if not active_group:
                 continue
+            self._enter_stage("activity_discovery")
             try:
                 indexes, discovery_failures = self.collector.list_relevant_many(
                     [snapshot.deal_id for _position, snapshot in active_group]
@@ -2234,6 +2574,7 @@ class ActivityPreparationPipeline:
                 if snapshot.deal_id not in discovery_failures
                 and indexes.get(snapshot.deal_id)
             }
+            self._enter_stage("activity_content")
             try:
                 initial_contents, content_failures = self.collector.fetch_contents_many(
                     content_indexes
@@ -2295,6 +2636,7 @@ class ActivityPreparationPipeline:
             if ai_pending:
                 if self.classifier is None:
                     raise AssertionError("AI candidates without classifier")
+                self._enter_stage("model_classification")
                 model_results = bounded_model_classifications(
                     self.classifier,
                     self.taxonomy,
@@ -2320,6 +2662,7 @@ class ActivityPreparationPipeline:
                     self.save_checkpoint()
                     raise transient_error
 
+            self._enter_stage("final_guard")
             projected_final_calls = 0
             for _position, snapshot, index_a, blocks, classification in ready:
                 by_alias = {block.alias: block.activity for block in blocks}
@@ -2408,29 +2751,10 @@ def _write_status(
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Подготовить private activity-v5 план без записи в Bitrix24"
-    )
-    parser.add_argument("--year", type=int, default=2025)
-    parser.add_argument("--plan", required=True)
-    parser.add_argument("--products", required=True)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--status", required=True)
-    parser.add_argument("--parent-map", default=str(DEFAULT_PARENT_MAP))
-    parser.add_argument("--max-deals", type=int, default=0)
-    parser.add_argument("--checkpoint-every", type=int, default=10)
-    parser.add_argument("--model-workers", type=int, default=5)
-    parser.add_argument("--api-call-cap", type=int, default=12_000)
-    parser.add_argument("--deterministic-only", action="store_true")
-    parser.add_argument("--include-category-present", action="store_true")
-    parser.add_argument("--resume", action="store_true")
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+def run_preparation(
+    args: argparse.Namespace,
+    diagnostics: SafePreparationDiagnostics,
+) -> dict[str, int]:
     private_paths = [
         Path(args.plan),
         Path(args.products),
@@ -2438,37 +2762,48 @@ def main() -> None:
         Path(args.status),
     ]
     for path in private_paths:
-        require_private_path(path)
+        try:
+            require_private_path(path)
+        except PreparationError as exc:
+            raise CodedPreparationError(
+                "Некорректный private output path",
+                failure_code="private_path_invalid",
+            ) from exc
     webhook = os.getenv("BITRIX_WEBHOOK_URL", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not webhook:
-        raise PreparationError("Нужен BITRIX_WEBHOOK_URL")
+        raise CodedPreparationError(
+            "Нужен BITRIX_WEBHOOK_URL",
+            failure_code="configuration_invalid",
+        )
     if not args.deterministic_only and not openai_key:
-        raise PreparationError("Нужен OPENAI_API_KEY")
-    timeout = int(os.getenv("ACTIVITY_PREP_HTTP_TIMEOUT", "90"))
+        raise CodedPreparationError(
+            "Нужен OPENAI_API_KEY",
+            failure_code="configuration_invalid",
+        )
+    try:
+        timeout = int(os.getenv("ACTIVITY_PREP_HTTP_TIMEOUT", "90"))
+        min_interval = float(
+            os.getenv("ACTIVITY_PREP_API_INTERVAL_SECONDS", "1.2")
+        )
+    except ValueError as exc:
+        raise CodedPreparationError(
+            "Некорректная конфигурация preparation runtime",
+            failure_code="configuration_invalid",
+        ) from exc
+    if timeout <= 0:
+        raise CodedPreparationError(
+            "Некорректная конфигурация preparation runtime",
+            failure_code="configuration_invalid",
+        )
+    stats = diagnostics.stats
     bitrix = ReliableBitrix(
         BitrixClient(webhook, timeout),
-        min_interval=float(os.getenv("ACTIVITY_PREP_API_INTERVAL_SECONDS", "1.2")),
+        min_interval=min_interval,
         call_cap=args.api_call_cap,
     )
-    excluded_stages = resolve_excluded_stages(bitrix)
-    category_enum = resolve_enum_field(bitrix, CATEGORY_FIELD)
-    subcategory_enum = resolve_enum_field(bitrix, SUBCATEGORY_FIELD)
-    taxonomy = load_live_validated_parent_map(
-        Path(args.parent_map),
-        year=args.year,
-        category_enum=category_enum,
-        subcategory_enum=subcategory_enum,
-    )
-    stats = PreparationStats()
-    deals = scan_remaining_deals(
-        bitrix,
-        year=args.year,
-        excluded_stage_ids=excluded_stages,
-        stats=stats,
-        max_deals=max(0, args.max_deals),
-        include_category_present=args.include_category_present,
-    )
+    stats.bitrix_api_call_cap = bitrix.call_cap
+    diagnostics.attach(bitrix=bitrix)
     classifier = None
     model = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
     if not args.deterministic_only:
@@ -2477,6 +2812,30 @@ def main() -> None:
             model,
             timeout=timeout,
         )
+        diagnostics.enter("model_canary")
+        classifier.canary()
+    diagnostics.enter("resolve_excluded_stages")
+    excluded_stages = resolve_excluded_stages(bitrix)
+    diagnostics.enter("resolve_live_fields")
+    category_enum = resolve_enum_field(bitrix, CATEGORY_FIELD)
+    subcategory_enum = resolve_enum_field(bitrix, SUBCATEGORY_FIELD)
+    diagnostics.enter("load_taxonomy")
+    taxonomy = load_live_validated_parent_map(
+        Path(args.parent_map),
+        year=args.year,
+        category_enum=category_enum,
+        subcategory_enum=subcategory_enum,
+    )
+    diagnostics.attach(taxonomy=taxonomy)
+    diagnostics.enter("scan_deals")
+    deals = scan_remaining_deals(
+        bitrix,
+        year=args.year,
+        excluded_stage_ids=excluded_stages,
+        stats=stats,
+        max_deals=max(0, args.max_deals),
+        include_category_present=args.include_category_present,
+    )
     run_identity = ":".join(
         (
             os.getenv("GITHUB_RUN_ID", "local"),
@@ -2503,14 +2862,30 @@ def main() -> None:
         scope_digest=scope_digest,
         model_workers=args.model_workers,
         stats=stats,
+        progress=diagnostics.enter,
     )
     if args.resume:
-        pipeline.load_checkpoint()
+        try:
+            pipeline.load_checkpoint()
+        except CodedPreparationError:
+            raise
+        except PreparationError as exc:
+            raise CodedPreparationError(
+                "Checkpoint не соответствует текущему запуску",
+                failure_code="checkpoint_invalid",
+            ) from exc
     elif Path(args.checkpoint).exists():
-        raise PreparationError("Checkpoint уже существует; нужен explicit --resume")
+        raise CodedPreparationError(
+            "Checkpoint уже существует; нужен explicit --resume",
+            failure_code="checkpoint_invalid",
+        )
     pipeline.run(deals, checkpoint_every=max(1, args.checkpoint_every))
     if not pipeline.plan_rows:
-        raise PreparationError("Не подготовлено ни одной безопасной строки плана")
+        raise CodedPreparationError(
+            "Не подготовлено ни одной безопасной строки плана",
+            failure_code="no_safe_rows",
+        )
+    diagnostics.enter("persist_outputs")
     atomic_private_json(Path(args.plan), pipeline.plan_rows)
     atomic_private_json(Path(args.products), {})
     pipeline.stats.bitrix_api_calls = bitrix.call_count
@@ -2522,18 +2897,66 @@ def main() -> None:
         scope_limit=args.max_deals,
         include_category_present=args.include_category_present,
     )
-    print(
-        json.dumps(
-            {
-                "accepted": pipeline.stats.accepted_full_pair
-                + pipeline.stats.accepted_category_only,
-                "category_only": pipeline.stats.accepted_category_only,
-                "full_pair": pipeline.stats.accepted_full_pair,
-                "remaining": pipeline.stats.remaining,
-            },
-            sort_keys=True,
-        )
+    diagnostics.succeed()
+    return {
+        "accepted": pipeline.stats.accepted_full_pair
+        + pipeline.stats.accepted_category_only,
+        "category_only": pipeline.stats.accepted_category_only,
+        "full_pair": pipeline.stats.accepted_full_pair,
+        "remaining": pipeline.stats.remaining,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Подготовить private activity-v5 план без записи в Bitrix24"
     )
+    parser.add_argument("--year", type=int, default=2025)
+    parser.add_argument("--plan", required=True)
+    parser.add_argument("--products", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--status", required=True)
+    parser.add_argument("--diagnostics", required=True)
+    parser.add_argument("--parent-map", default=str(DEFAULT_PARENT_MAP))
+    parser.add_argument("--max-deals", type=int, default=0)
+    parser.add_argument("--checkpoint-every", type=int, default=10)
+    parser.add_argument("--model-workers", type=int, default=5)
+    parser.add_argument("--api-call-cap", type=int, default=12_000)
+    parser.add_argument("--deterministic-only", action="store_true")
+    parser.add_argument("--include-category-present", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    diagnostics: SafePreparationDiagnostics | None = None
+    try:
+        diagnostics = SafePreparationDiagnostics(
+            Path(args.diagnostics),
+            PreparationStats(),
+        )
+        diagnostics.enter("bootstrap")
+        summary = run_preparation(args, diagnostics)
+    except Exception as exc:
+        stage = diagnostics.stage if diagnostics is not None else "bootstrap"
+        failure_code = diagnostic_failure_code(exc, stage=stage)
+        if diagnostics is not None:
+            try:
+                failure_code = diagnostics.fail(exc)
+            except Exception:
+                failure_code = "private_state_io"
+        # This is intentionally enum-only. Full exception details remain out
+        # of stdout/stderr because workflow logs are durable and public to
+        # repository readers.
+        LOG.error(
+            "activity_preparation_failed stage=%s failure_code=%s",
+            stage,
+            failure_code,
+        )
+        raise SystemExit(1) from None
+    print(json.dumps(summary, sort_keys=True))
 
 
 if __name__ == "__main__":
