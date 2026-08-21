@@ -8,6 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 
 from classifier.precision_plan import (
@@ -494,6 +495,28 @@ class PrecisionWorkerTests(unittest.TestCase):
         self.assertEqual(list(chunks(range(5), 2)), [[0, 1], [2, 3], [4]])
         self.assertTrue(is_transient_error(RuntimeError("OVERLOAD_LIMIT")))
         self.assertFalse(is_transient_error(ValueError("invalid field")))
+        self.assertFalse(
+            is_transient_error(
+                HTTPError("https://example.test", 400, "bad", {}, None)
+            )
+        )
+        self.assertTrue(
+            is_transient_error(
+                HTTPError("https://example.test", 429, "busy", {}, None)
+            )
+        )
+        for status in (408, 409):
+            self.assertTrue(
+                is_transient_error(
+                    HTTPError("https://example.test", status, "retry", {}, None)
+                )
+            )
+        self.assertTrue(
+            is_transient_error(
+                HTTPError("https://example.test", 503, "busy", {}, None)
+            )
+        )
+        self.assertTrue(is_transient_error(URLError("temporarily unavailable")))
         with patch("classifier.precision_worker.random.uniform", return_value=1.2):
             self.assertEqual(retry_delay(999, quota=True), 900.0)
 
