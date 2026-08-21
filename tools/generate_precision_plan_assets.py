@@ -6,15 +6,19 @@ import os
 from pathlib import Path
 
 from classifier.precision_plan import (
+    FORBIDDEN_CATEGORY_IDS,
     PLAN_FORMAT,
     PLAN_VERSION,
+    canonical_deal_text_evidence,
     canonical_product_evidence,
+    category_desired_fingerprint,
     derive_plan_key,
     desired_fingerprint,
     entries_digest,
     key_check,
     manifest_mac,
     portal_identity,
+    subcategory_guard_fingerprint,
     transition_fingerprint,
 )
 
@@ -40,7 +44,7 @@ def main() -> None:
     products = json.loads(Path(args.products).read_text())
 
     seen_ids: set[int] = set()
-    fingerprints: list[tuple[str, str, str]] = []
+    fingerprints: list[tuple[str, str, str, str]] = []
     categories: dict[str, str] = {}
     subcategories: dict[str, str] = {}
     pairs: set[tuple[str, str]] = set()
@@ -50,9 +54,22 @@ def main() -> None:
             raise ValueError(f"Дублирующийся ID сделки: {deal_id}")
         seen_ids.add(deal_id)
         category = str(row["category_id"])
-        subcategory = str(row["subcategory_id"])
         original_category = str(row.get("current_category_id") or "")
         original_subcategory = str(row.get("current_subcategory_id") or "")
+        category_only = row.get("category_only", False)
+        if not isinstance(category_only, bool):
+            raise ValueError(f"У сделки {deal_id} category_only должен быть boolean")
+        if category in FORBIDDEN_CATEGORY_IDS:
+            raise ValueError(f"У сделки {deal_id} запрещённая категория: {category}")
+        if category_only:
+            supplied_subcategory = str(row.get("subcategory_id") or "")
+            if supplied_subcategory and supplied_subcategory != original_subcategory:
+                raise ValueError(
+                    f"У сделки {deal_id} category_only не может менять подкатегорию"
+                )
+            subcategory = original_subcategory
+        else:
+            subcategory = str(row["subcategory_id"])
         reason = str(row.get("reason") or "")
         if reason == "existing_precise_subcategory":
             evidence_mode = "fields"
@@ -60,30 +77,41 @@ def main() -> None:
             evidence_mode = "title"
         elif reason == "product_value":
             evidence_mode = "products"
+        elif reason == "deal_text":
+            evidence_mode = "deal_text"
         else:
             raise ValueError(f"У сделки {deal_id} неподдерживаемый источник: {reason}")
-        if evidence_mode == "fields":
+        if category_only:
+            evidence_mode = f"category_{evidence_mode}"
+        base_evidence_mode = evidence_mode.removeprefix("category_")
+        if base_evidence_mode == "fields":
             evidence = ""
-        elif evidence_mode == "title":
+        elif base_evidence_mode == "title":
             evidence = str(row.get("title") or "")
-        else:
+        elif base_evidence_mode == "products":
             if str(deal_id) not in products:
                 raise ValueError(f"У сделки {deal_id} нет снимка товарных строк")
             product_rows = products[str(deal_id)]
             if not product_rows:
                 raise ValueError(f"У сделки {deal_id} пустой снимок товарных строк")
             evidence = canonical_product_evidence(product_rows)
-        if evidence_mode == "title" and not evidence:
+        else:
+            comments = row.get("comments")
+            if comments is None or comments is False or str(comments) == "":
+                raise ValueError(f"У сделки {deal_id} нет комментария для проверки источника")
+            evidence = canonical_deal_text_evidence(row.get("title"), comments)
+        if base_evidence_mode == "title" and not evidence:
             raise ValueError(f"У сделки {deal_id} нет названия для проверки источника")
         category_label = str(row["category"])
-        subcategory_label = str(row["subcategory"])
         if category in categories and categories[category] != category_label:
             raise ValueError(f"У категории {category} два разных названия")
-        if subcategory in subcategories and subcategories[subcategory] != subcategory_label:
-            raise ValueError(f"У подкатегории {subcategory} два разных названия")
         categories[category] = category_label
-        subcategories[subcategory] = subcategory_label
-        pairs.add((category, subcategory))
+        if not category_only:
+            subcategory_label = str(row["subcategory"])
+            if subcategory in subcategories and subcategories[subcategory] != subcategory_label:
+                raise ValueError(f"У подкатегории {subcategory} два разных названия")
+            subcategories[subcategory] = subcategory_label
+            pairs.add((category, subcategory))
         fingerprints.append(
             (
                 transition_fingerprint(
@@ -96,8 +124,21 @@ def main() -> None:
                     evidence_mode,
                     evidence,
                 ),
-                desired_fingerprint(key, deal_id, category, subcategory),
+                (
+                    category_desired_fingerprint(key, deal_id, category)
+                    if category_only
+                    else desired_fingerprint(key, deal_id, category, subcategory)
+                ),
                 evidence_mode,
+                (
+                    subcategory_guard_fingerprint(
+                        key,
+                        deal_id,
+                        original_subcategory,
+                    )
+                    if category_only
+                    else "-"
+                ),
             )
         )
 
@@ -107,8 +148,8 @@ def main() -> None:
         raise ValueError("Коллизия или дубль отпечатка результата")
 
     content_lines = [
-        f"{transition}\t{target}\t{evidence_mode}"
-        for transition, target, evidence_mode in sorted(fingerprints)
+        f"{transition}\t{target}\t{evidence_mode}\t{subcategory_guard}"
+        for transition, target, evidence_mode, subcategory_guard in sorted(fingerprints)
     ]
     header = {
         "format": PLAN_FORMAT,
