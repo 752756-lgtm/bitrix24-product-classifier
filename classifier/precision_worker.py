@@ -21,8 +21,12 @@ from urllib.parse import urlencode
 from .bitrix import BitrixClient
 from .precision_plan import (
     ApprovedPlan,
+    FORBIDDEN_CATEGORY_IDS,
+    base_evidence_mode,
+    canonical_deal_text_evidence,
     canonical_product_evidence,
     derive_plan_key,
+    is_category_only_mode,
     portal_identity,
 )
 
@@ -238,7 +242,7 @@ class State:
         stage_id: str,
         status: str,
         evidence_mode: str,
-        source: str = "approved_plan_v2",
+        source: str = "approved_plan",
     ) -> None:
         now = utc_now()
         self.db.execute(
@@ -267,7 +271,12 @@ class State:
         }
 
 
-def load_taxonomy(path: Path, year: int) -> tuple[dict[str, str], dict[str, str], tuple[tuple[str, str], ...], str]:
+def load_taxonomy(
+    path: Path,
+    year: int,
+    *,
+    require_pairs: bool = True,
+) -> tuple[dict[str, str], dict[str, str], tuple[tuple[str, str], ...], str]:
     raw = path.read_bytes()
     payload = json.loads(raw)
     if payload.get("format") != "bitrix24-precision-taxonomy-v1":
@@ -277,7 +286,16 @@ def load_taxonomy(path: Path, year: int) -> tuple[dict[str, str], dict[str, str]
     categories = {str(key): str(value) for key, value in payload["categories"].items()}
     subcategories = {str(key): str(value) for key, value in payload["subcategories"].items()}
     pairs = tuple((str(pair[0]), str(pair[1])) for pair in payload["pairs"])
-    if not pairs or any(cat not in categories or sub not in subcategories for cat, sub in pairs):
+    if not categories:
+        raise PermanentWorkerError("Таксономия не содержит целевых категорий")
+    forbidden = sorted(FORBIDDEN_CATEGORY_IDS.intersection(categories))
+    if forbidden:
+        raise PermanentWorkerError(
+            "Таксономия содержит запрещённые категории: " + ", ".join(forbidden)
+        )
+    if require_pairs and not pairs:
+        raise PermanentWorkerError("Таксономия не содержит полных пар")
+    if any(cat not in categories or sub not in subcategories for cat, sub in pairs):
         raise PermanentWorkerError("Таксономия содержит неполную пару")
     return categories, subcategories, pairs, hashlib.sha256(raw).hexdigest()
 
@@ -303,6 +321,11 @@ class PrecisionWorker:
         self.expected_categories = expected_categories
         self.expected_subcategories = expected_subcategories
         self.allowed_pairs = allowed_pairs
+        self.allowed_category_ids = tuple(
+            category
+            for category in expected_categories
+            if category not in FORBIDDEN_CATEGORY_IDS
+        )
         self.identity = identity
         self.year = year
         self.batch_size = min(max(batch_size, 1), 50)
@@ -357,10 +380,22 @@ class PrecisionWorker:
     @staticmethod
     def _category_rows(value: Any) -> list[dict[str, Any]]:
         if isinstance(value, dict):
-            rows = value.get("categories", [])
-        else:
+            if "categories" not in value or not isinstance(value["categories"], list):
+                raise PermanentWorkerError(
+                    "crm.category.list вернул ответ без списка categories"
+                )
+            rows = value["categories"]
+        elif isinstance(value, list):
             rows = value
-        return rows if isinstance(rows, list) else []
+        else:
+            raise PermanentWorkerError(
+                "crm.category.list вернул ответ неожиданного типа"
+            )
+        if any(not isinstance(row, dict) for row in rows):
+            raise PermanentWorkerError(
+                "crm.category.list вернул некорректную строку воронки"
+            )
+        return rows
 
     def _resolve_excluded_stages(self) -> set[str]:
         category_ids = {0}
@@ -435,6 +470,13 @@ class PrecisionWorker:
         subcategories = self._resolve_enum_field(SUBCATEGORY_FIELD)
         self._validate_enum(self.expected_categories, categories, CATEGORY_FIELD)
         self._validate_enum(self.expected_subcategories, subcategories, SUBCATEGORY_FIELD)
+        if set(self.expected_categories).intersection(FORBIDDEN_CATEGORY_IDS):
+            raise PermanentWorkerError("Запрещённая категория не может быть целью плана")
+        self.allowed_category_ids = tuple(
+            category
+            for category in self.expected_categories
+            if category in categories and category not in FORBIDDEN_CATEGORY_IDS
+        )
         self.excluded_stage_ids = excluded
         self.metadata_resolved_at = time.time()
 
@@ -458,9 +500,10 @@ class PrecisionWorker:
                 },
             ) or []
             candidates: list[
-                tuple[dict[str, Any], tuple[str, str], tuple[str, str], str]
+                tuple[dict[str, Any], tuple[str, str], tuple[str, str], str, bool]
             ] = []
             product_evidence_ids: list[int] = []
+            deal_text_ids: list[int] = []
             for deal in rows:
                 deal_id = int(deal["ID"])
                 last_id = max(last_id, deal_id)
@@ -469,36 +512,91 @@ class PrecisionWorker:
                     normalized(deal.get(SUBCATEGORY_FIELD)),
                 )
                 target = self.approved_plan.target_for(
-                    deal_id, self.allowed_pairs, current=current
+                    deal_id,
+                    self.allowed_pairs,
+                    current=current,
+                    allowed_categories=self.allowed_category_ids,
                 )
                 if target is None:
                     continue
                 desired = (target[0], target[1])
                 evidence_mode = target[2]
+                guard_match = target[3]
                 stage_id = normalized(deal.get("STAGE_ID"))
-                candidates.append((deal, current, desired, evidence_mode))
+                candidates.append(
+                    (deal, current, desired, evidence_mode, guard_match)
+                )
                 if (
-                    evidence_mode == "products"
+                    base_evidence_mode(evidence_mode) == "products"
                     and stage_id not in self.excluded_stage_ids
                     and current != desired
+                    and (not is_category_only_mode(evidence_mode) or guard_match)
                 ):
                     product_evidence_ids.append(deal_id)
+                if (
+                    base_evidence_mode(evidence_mode) == "deal_text"
+                    and stage_id not in self.excluded_stage_ids
+                    and current != desired
+                    and (not is_category_only_mode(evidence_mode) or guard_match)
+                ):
+                    deal_text_ids.append(deal_id)
 
             product_evidence = self.fetch_product_evidence(product_evidence_ids)
-            for deal, current, desired, evidence_mode in candidates:
+            # COMMENTS is sensitive and can be large, so fetch it only for
+            # pending deal_text rows. All fields from this response form one
+            # authoritative snapshot; the lightweight scan row is not mixed in.
+            deal_text_live = self.fetch_live(deal_text_ids)
+            for deal, current, desired, evidence_mode, guard_match in candidates:
                 deal_id = int(deal["ID"])
                 stage_id = normalized(deal.get("STAGE_ID"))
-                if evidence_mode == "title":
+                target_matches = True
+                evidence_kind = base_evidence_mode(evidence_mode)
+                if evidence_kind == "deal_text" and deal_id in deal_text_ids:
+                    authoritative = deal_text_live.get(deal_id)
+                    if authoritative is None:
+                        self.state.enqueue(
+                            deal_id, current, desired, "", "missing", evidence_mode
+                        )
+                        continue
+                    current = authoritative[:2]
+                    stage_id = authoritative[2]
+                    refreshed_target = self.approved_plan.target_for(
+                        deal_id,
+                        self.allowed_pairs,
+                        current=current,
+                        allowed_categories=self.allowed_category_ids,
+                    )
+                    if refreshed_target is None:
+                        target_matches = False
+                        guard_match = False
+                    else:
+                        if is_category_only_mode(evidence_mode):
+                            target_matches = (
+                                refreshed_target[0] == desired[0]
+                                and refreshed_target[2] == evidence_mode
+                            )
+                        else:
+                            target_matches = refreshed_target[:3] == (
+                                desired[0], desired[1], evidence_mode
+                            )
+                        desired = (refreshed_target[0], refreshed_target[1])
+                        guard_match = refreshed_target[3]
+                    evidence = canonical_deal_text_evidence(
+                        authoritative[3], authoritative[4]
+                    )
+                elif evidence_kind == "title":
                     evidence = normalized(deal.get("TITLE"))
-                elif evidence_mode == "products":
+                elif evidence_kind == "products":
                     evidence = product_evidence.get(deal_id, "")
                 else:
                     evidence = ""
                 if stage_id in self.excluded_stage_ids:
                     status = "excluded_stage"
+                elif is_category_only_mode(evidence_mode) and not guard_match:
+                    status = "conflict"
                 elif current == desired:
                     status = "verified"
-                elif self.approved_plan.approves_transition(
+                elif target_matches and self.approved_plan.approves_transition(
                     deal_id, current, desired, evidence_mode, evidence
                 ):
                     status = "pending"
@@ -528,26 +626,31 @@ class PrecisionWorker:
                 self.write_status()
                 return
 
-    def fetch_live(self, deal_ids: list[int]) -> dict[int, tuple[str, str, str, str]]:
+    def fetch_live(self, deal_ids: list[int]) -> dict[int, tuple[str, str, str, str, str]]:
         if not deal_ids:
             return {}
-        rows = self.call(
-            "crm.deal.list",
-            {
-                "filter": {"@ID": deal_ids},
-                "select": ["ID", "STAGE_ID", "TITLE", CATEGORY_FIELD, SUBCATEGORY_FIELD],
-                "order": {"ID": "ASC"},
-            },
-        ) or []
-        return {
-            int(row["ID"]): (
-                normalized(row.get(CATEGORY_FIELD)),
-                normalized(row.get(SUBCATEGORY_FIELD)),
-                normalized(row.get("STAGE_ID")),
-                normalized(row.get("TITLE")),
-            )
-            for row in rows
-        }
+        result: dict[int, tuple[str, str, str, str, str]] = {}
+        for group in chunks(deal_ids, 50):
+            rows = self.call(
+                "crm.deal.list",
+                {
+                    "filter": {"@ID": group},
+                    "select": [
+                        "ID", "STAGE_ID", "TITLE", "COMMENTS",
+                        CATEGORY_FIELD, SUBCATEGORY_FIELD,
+                    ],
+                    "order": {"ID": "ASC"},
+                },
+            ) or []
+            for row in rows:
+                result[int(row["ID"])] = (
+                    normalized(row.get(CATEGORY_FIELD)),
+                    normalized(row.get(SUBCATEGORY_FIELD)),
+                    normalized(row.get("STAGE_ID")),
+                    normalized(row.get("TITLE")),
+                    normalized(row.get("COMMENTS")),
+                )
+        return result
 
     def fetch_product_evidence(self, deal_ids: list[int]) -> dict[int, str]:
         if not deal_ids:
@@ -583,7 +686,7 @@ class PrecisionWorker:
     def classify_live(
         self,
         item: sqlite3.Row,
-        live: tuple[str, str, str, str] | None,
+        live: tuple[str, str, str, str, str] | None,
         product_evidence: str | None = None,
     ) -> str:
         if live is None:
@@ -593,14 +696,24 @@ class PrecisionWorker:
         current = live[:2]
         desired = (item["desired_category"], item["desired_subcategory"])
         original = (item["original_category"], item["original_subcategory"])
+        evidence_mode = str(item["evidence_mode"])
+        if (
+            is_category_only_mode(evidence_mode)
+            and not self.approved_plan.category_guard_matches(
+                int(item["deal_id"]), desired[0], current[1]
+            )
+        ):
+            return "conflict"
         if current == desired:
             return "verified"
         if current != original:
             return "conflict"
-        evidence_mode = str(item["evidence_mode"])
-        if evidence_mode == "title":
+        evidence_kind = base_evidence_mode(evidence_mode)
+        if evidence_kind == "title":
             evidence = live[3]
-        elif evidence_mode == "products":
+        elif evidence_kind == "deal_text":
+            evidence = canonical_deal_text_evidence(live[3], live[4])
+        elif evidence_kind == "products":
             if product_evidence is None:
                 return "conflict"
             evidence = product_evidence
@@ -640,7 +753,7 @@ class PrecisionWorker:
                 [
                     int(row["deal_id"])
                     for row in group
-                    if row["evidence_mode"] == "products"
+                    if base_evidence_mode(str(row["evidence_mode"])) == "products"
                 ]
             )
             for row in group:
@@ -699,7 +812,7 @@ class PrecisionWorker:
             [
                 int(row["deal_id"])
                 for row in rows
-                if row["evidence_mode"] == "products"
+                if base_evidence_mode(str(row["evidence_mode"])) == "products"
             ]
         )
         # Stage and category fields are fetched last, immediately before the
@@ -724,16 +837,17 @@ class PrecisionWorker:
             self.write_status()
             return True
 
-        commands = {
-            f"deal_{row['deal_id']}": "crm.deal.update?" + urlencode(
-                [
-                    ("id", str(row["deal_id"])),
-                    (f"fields[{CATEGORY_FIELD}]", str(row["desired_category"])),
-                    (f"fields[{SUBCATEGORY_FIELD}]", str(row["desired_subcategory"])),
-                ]
-            )
-            for row in writable
-        }
+        commands = {}
+        for row in writable:
+            fields = [
+                ("id", str(row["deal_id"])),
+                (f"fields[{CATEGORY_FIELD}]", str(row["desired_category"])),
+            ]
+            if not is_category_only_mode(str(row["evidence_mode"])):
+                fields.append(
+                    (f"fields[{SUBCATEGORY_FIELD}]", str(row["desired_subcategory"]))
+                )
+            commands[f"deal_{row['deal_id']}"] = "crm.deal.update?" + urlencode(fields)
         self.state.set_meta("last_write_started", time.time())
 
         write_error: BaseException | None = None
@@ -761,7 +875,7 @@ class PrecisionWorker:
                     [
                         int(row["deal_id"])
                         for row in writable
-                        if row["evidence_mode"] == "products"
+                        if base_evidence_mode(str(row["evidence_mode"])) == "products"
                     ]
                 )
             except Exception as exc:
@@ -770,7 +884,7 @@ class PrecisionWorker:
         for row in writable:
             deal_id = int(row["deal_id"])
             deal_live = after.get(deal_id)
-            needs_product = row["evidence_mode"] == "products"
+            needs_product = base_evidence_mode(str(row["evidence_mode"])) == "products"
             product_missing = needs_product and deal_id not in after_products
             current_is_desired = bool(
                 deal_live
@@ -993,7 +1107,9 @@ def main() -> None:
     if should_persist_plan_key:
         persist_plan_key(plan_key_path, plan_key)
     categories, subcategories, pairs, taxonomy_digest = load_taxonomy(
-        Path(args.taxonomy), args.year
+        Path(args.taxonomy),
+        args.year,
+        require_pairs=approved.requires_full_pairs,
     )
     identity = {
         "schema": STATE_SCHEMA_VERSION,

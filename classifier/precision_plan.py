@@ -4,17 +4,46 @@ import hashlib
 import hmac
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
 
 
-PLAN_FORMAT = "bitrix24-precision-allowlist-v2"
-PLAN_VERSION = 2
+PLAN_FORMAT_V2 = "bitrix24-precision-allowlist-v2"
+PLAN_FORMAT_V3 = "bitrix24-precision-allowlist-v3"
+PLAN_FORMAT = "bitrix24-precision-allowlist-v4"
+PLAN_VERSION = 4
 FINGERPRINT_RE = re.compile(r"^[0-9a-f]{32}$")
 _DOMAIN = b"bitrix24-precision-plan-v1"
-EVIDENCE_MODES = frozenset({"fields", "title", "products"})
+DEAL_TEXT_CANON_VERSION = "bitrix24-deal-text-v1"
+EVIDENCE_MODES_V2 = frozenset({"fields", "title", "products"})
+EVIDENCE_MODES_V3 = EVIDENCE_MODES_V2 | {"deal_text"}
+CATEGORY_ONLY_EVIDENCE_MODES = frozenset(
+    {
+        "category_fields",
+        "category_title",
+        "category_products",
+        "category_deal_text",
+    }
+)
+EVIDENCE_MODES = EVIDENCE_MODES_V3 | CATEGORY_ONLY_EVIDENCE_MODES
+FORBIDDEN_CATEGORY_IDS = frozenset({"6901"})
+PLAN_PROTOCOLS = {
+    (PLAN_FORMAT_V2, 2): EVIDENCE_MODES_V2,
+    (PLAN_FORMAT_V3, 3): EVIDENCE_MODES_V3,
+    (PLAN_FORMAT, PLAN_VERSION): EVIDENCE_MODES,
+}
+
+
+def is_category_only_mode(evidence_mode: str) -> bool:
+    return evidence_mode in CATEGORY_ONLY_EVIDENCE_MODES
+
+
+def base_evidence_mode(evidence_mode: str) -> str:
+    if is_category_only_mode(evidence_mode):
+        return evidence_mode.removeprefix("category_")
+    return evidence_mode
 
 
 def derive_plan_key(secret: str, portal_id: str = "") -> bytes:
@@ -69,6 +98,19 @@ def canonical_product_evidence(rows: list[dict[str, object]]) -> str:
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
 
 
+def canonical_deal_text_evidence(title: object, comments: object) -> str:
+    """Preserve the exact REST representation of standard deal text fields."""
+
+    def value(raw: object) -> str:
+        return "" if raw is None or raw is False else str(raw)
+
+    return json.dumps(
+        [DEAL_TEXT_CANON_VERSION, value(title), value(comments)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _fingerprint(key: bytes, purpose: bytes, parts: tuple[object, ...]) -> str:
     payload = purpose + b"\0" + json.dumps(
         [str(part) for part in parts],
@@ -118,6 +160,30 @@ def desired_fingerprint(
     )
 
 
+def category_desired_fingerprint(
+    key: bytes,
+    deal_id: int,
+    desired_category: str,
+) -> str:
+    return _fingerprint(
+        key,
+        b"category-desired",
+        (int(deal_id), str(desired_category)),
+    )
+
+
+def subcategory_guard_fingerprint(
+    key: bytes,
+    deal_id: int,
+    original_subcategory: str,
+) -> str:
+    return _fingerprint(
+        key,
+        b"subcategory-guard",
+        (int(deal_id), str(original_subcategory)),
+    )
+
+
 def key_check(key: bytes) -> str:
     return hmac.new(key, _DOMAIN + b"\0key-check", hashlib.sha256).hexdigest()
 
@@ -144,6 +210,11 @@ class ApprovedPlan:
     desired_modes: dict[str, str]
     digest: str
     key: bytes
+    subcategory_guards: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def requires_full_pairs(self) -> bool:
+        return any(not is_category_only_mode(mode) for mode in self.desired_modes.values())
 
     @classmethod
     def load(
@@ -158,8 +229,14 @@ class ApprovedPlan:
         if not lines:
             raise ValueError("Файл согласованного плана пуст")
         header = json.loads(lines[0])
-        if header.get("format") != PLAN_FORMAT or int(header.get("version", 0)) != PLAN_VERSION:
+        try:
+            protocol = (str(header.get("format", "")), int(header.get("version", 0)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Неподдерживаемый формат согласованного плана") from exc
+        allowed_evidence_modes = PLAN_PROTOCOLS.get(protocol)
+        if allowed_evidence_modes is None:
             raise ValueError("Неподдерживаемый формат согласованного плана")
+        is_v4 = protocol == (PLAN_FORMAT, PLAN_VERSION)
         year = int(header.get("year", 0))
         if year != expected_year:
             raise ValueError(f"План рассчитан на {year}, а worker запущен для {expected_year}")
@@ -180,21 +257,34 @@ class ApprovedPlan:
 
         transitions: set[str] = set()
         desired_modes: dict[str, str] = {}
+        subcategory_guards: dict[str, str] = {}
         for line_number, line in enumerate(lines[1:], start=2):
             if not line.strip():
                 continue
-            try:
-                transition, target, evidence_mode = line.split("\t")
-            except ValueError as exc:
-                raise ValueError(f"Некорректная строка плана {line_number}") from exc
+            columns = line.split("\t")
+            expected_columns = 4 if is_v4 else 3
+            if len(columns) != expected_columns:
+                raise ValueError(f"Некорректная строка плана {line_number}")
+            transition, target, evidence_mode = columns[:3]
+            subcategory_guard = columns[3] if is_v4 else "-"
             if not FINGERPRINT_RE.fullmatch(transition) or not FINGERPRINT_RE.fullmatch(target):
                 raise ValueError(f"Некорректный отпечаток в строке {line_number}")
-            if evidence_mode not in EVIDENCE_MODES:
+            if evidence_mode not in allowed_evidence_modes:
                 raise ValueError(f"Некорректный источник в строке {line_number}")
+            if is_category_only_mode(evidence_mode):
+                if not FINGERPRINT_RE.fullmatch(subcategory_guard):
+                    raise ValueError(
+                        f"Некорректная защита подкатегории в строке {line_number}"
+                    )
+            elif subcategory_guard != "-":
+                raise ValueError(
+                    f"Некорректная защита подкатегории в строке {line_number}"
+                )
             transitions.add(transition)
             if target in desired_modes:
                 raise ValueError(f"Дублирующийся результат в строке {line_number}")
             desired_modes[target] = evidence_mode
+            subcategory_guards[target] = subcategory_guard
 
         count = int(header.get("count", 0))
         if count <= 0 or len(transitions) != count or len(desired_modes) != count:
@@ -209,24 +299,72 @@ class ApprovedPlan:
             desired_modes=desired_modes,
             digest=hashlib.sha256(raw).hexdigest(),
             key=key,
+            subcategory_guards=subcategory_guards,
         )
+
+    def category_guard_matches(
+        self,
+        deal_id: int,
+        desired_category: str,
+        live_subcategory: str,
+    ) -> bool:
+        target = category_desired_fingerprint(self.key, deal_id, desired_category)
+        evidence_mode = self.desired_modes.get(target)
+        if not evidence_mode or not is_category_only_mode(evidence_mode):
+            return False
+        expected_guard = self.subcategory_guards.get(target, "")
+        live_guard = subcategory_guard_fingerprint(
+            self.key,
+            deal_id,
+            live_subcategory,
+        )
+        return hmac.compare_digest(expected_guard, live_guard)
 
     def target_for(
         self,
         deal_id: int,
         allowed_pairs: tuple[tuple[str, str], ...],
         current: tuple[str, str] | None = None,
-    ) -> tuple[str, str, str] | None:
-        if current:
+        allowed_categories: tuple[str, ...] = (),
+    ) -> tuple[str, str, str, bool] | None:
+        allowed_pair_set = set(allowed_pairs)
+        allowed_category_set = {
+            str(category)
+            for category in allowed_categories
+            if str(category) not in FORBIDDEN_CATEGORY_IDS
+        }
+        if current and current[0] not in FORBIDDEN_CATEGORY_IDS:
             fingerprint = desired_fingerprint(self.key, deal_id, current[0], current[1])
-            if fingerprint in self.desired_modes:
-                return current[0], current[1], self.desired_modes[fingerprint]
+            evidence_mode = self.desired_modes.get(fingerprint)
+            if (
+                evidence_mode
+                and not is_category_only_mode(evidence_mode)
+                and current in allowed_pair_set
+            ):
+                return current[0], current[1], evidence_mode, True
         for category, subcategory in allowed_pairs:
+            if category in FORBIDDEN_CATEGORY_IDS:
+                continue
             if current == (category, subcategory):
                 continue
             fingerprint = desired_fingerprint(self.key, deal_id, category, subcategory)
-            if fingerprint in self.desired_modes:
-                return category, subcategory, self.desired_modes[fingerprint]
+            evidence_mode = self.desired_modes.get(fingerprint)
+            if evidence_mode and not is_category_only_mode(evidence_mode):
+                return category, subcategory, evidence_mode, True
+        # Category-only target discovery is intentionally independent of the
+        # live subcategory. The separate signed guard makes a changed value a
+        # discovered conflict instead of silently leaving the row undiscovered.
+        if current:
+            for category in sorted(allowed_category_set):
+                fingerprint = category_desired_fingerprint(self.key, deal_id, category)
+                evidence_mode = self.desired_modes.get(fingerprint)
+                if evidence_mode and is_category_only_mode(evidence_mode):
+                    guard_match = self.category_guard_matches(
+                        deal_id,
+                        category,
+                        current[1],
+                    )
+                    return category, current[1], evidence_mode, guard_match
         return None
 
     def approves_transition(
