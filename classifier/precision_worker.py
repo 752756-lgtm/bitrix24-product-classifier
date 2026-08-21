@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -22,10 +23,16 @@ from .bitrix import BitrixClient
 from .precision_plan import (
     ApprovedPlan,
     FORBIDDEN_CATEGORY_IDS,
+    MAX_RELEVANT_ACTIVITIES,
+    activity_kind,
+    activity_locator_fingerprint,
     base_evidence_mode,
+    canonical_activity_evidence,
+    canonical_activity_index,
     canonical_deal_text_evidence,
     canonical_product_evidence,
     derive_plan_key,
+    is_activity_mode,
     is_category_only_mode,
     portal_identity,
 )
@@ -37,6 +44,27 @@ CATEGORY_FIELD = "UF_CRM_1776320088319"
 SUBCATEGORY_FIELD = "UF_CRM_1568228872884"
 STATE_SCHEMA_VERSION = 3
 MAX_UNCONFIRMED_ATTEMPTS = 3
+ACTIVITY_PAGE_SIZE = 50
+ACTIVITY_CONTENT_BATCH_SIZE = 20
+MAX_ACTIVITY_ROWS_PER_WRITE = 5
+
+ACTIVITY_INDEX_FIELDS = [
+    "ID",
+    "OWNER_ID",
+    "OWNER_TYPE_ID",
+    "TYPE_ID",
+    "DIRECTION",
+    "PROVIDER_ID",
+    "PROVIDER_TYPE_ID",
+    "SUBJECT",
+    "DESCRIPTION_TYPE",
+    "CREATED",
+    "LAST_UPDATED",
+    "START_TIME",
+    "END_TIME",
+    "COMPLETED",
+    "BINDINGS",
+]
 
 EXCLUDED_STAGE_NAMES = {
     "дубль",
@@ -130,6 +158,14 @@ def is_transient_error(exc: BaseException | str) -> bool:
     )
 
 
+def is_batch_timeout_error(exc: BaseException | str) -> bool:
+    text = str(exc).casefold()
+    return isinstance(exc, TimeoutError) or any(
+        marker in text
+        for marker in ("timed out", "timeout", "operation_time_limit")
+    )
+
+
 def retry_delay(attempt: int, quota: bool = False) -> float:
     base = 180.0 if quota else 20.0
     raw = base * (2 ** min(max(attempt - 1, 0), 4)) * random.uniform(0.8, 1.2)
@@ -147,6 +183,20 @@ class StopRequested(Exception):
 
 class PermanentWorkerError(RuntimeError):
     pass
+
+
+class ActivityEvidenceUnavailable(RuntimeError):
+    def __init__(
+        self,
+        *,
+        transient: bool,
+        method_not_allowed: bool = False,
+        split_batch: bool = False,
+    ):
+        super().__init__("Activity evidence временно недоступно")
+        self.transient = transient
+        self.method_not_allowed = method_not_allowed
+        self.split_batch = split_batch
 
 
 class RateLimitedBitrix:
@@ -596,6 +646,10 @@ class PrecisionWorker:
                     status = "conflict"
                 elif current == desired:
                     status = "verified"
+                elif evidence_kind == "activities" and target_matches:
+                    # Activity bodies/transcripts are intentionally deferred
+                    # until the final pre-write guard.
+                    status = "pending"
                 elif target_matches and self.approved_plan.approves_transition(
                     deal_id, current, desired, evidence_mode, evidence
                 ):
@@ -683,11 +737,465 @@ class PrecisionWorker:
             for deal_id, product_rows in rows_by_deal.items()
         }
 
+    @staticmethod
+    def _activity_rows(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, dict):
+            value = value.get("activities")
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            raise ValueError("Bitrix24 вернул некорректный activity index")
+        return value
+
+    def list_relevant_activities(self, deal_id: int) -> list[dict[str, Any]]:
+        last_id = 0
+        relevant: list[dict[str, Any]] = []
+        while True:
+            try:
+                result = self.call(
+                    "crm.activity.list",
+                    {
+                        "filter": {
+                            "BINDINGS": [
+                                {"OWNER_TYPE_ID": 2, "OWNER_ID": int(deal_id)}
+                            ],
+                            ">ID": last_id,
+                        },
+                        "order": {"ID": "ASC"},
+                        "select": ACTIVITY_INDEX_FIELDS,
+                        "start": 0,
+                    },
+                )
+            except StopRequested:
+                raise
+            except Exception as exc:
+                raise ActivityEvidenceUnavailable(
+                    transient=is_transient_error(exc)
+                ) from None
+            rows = self._activity_rows(result or [])
+            page_last = last_id
+            for row in rows:
+                raw_id = normalized(row.get("ID", row.get("id")))
+                if not raw_id.isdigit() or int(raw_id) <= page_last:
+                    raise ValueError("Activity index нарушил keyset pagination")
+                page_last = int(raw_id)
+                kind = activity_kind(row)
+                if kind is None:
+                    continue
+                try:
+                    canonical_activity_index(deal_id, [row])
+                except ValueError:
+                    raise ValueError("Relevant activity не прошла scope guard") from None
+                relevant.append(row)
+                if len(relevant) > MAX_RELEVANT_ACTIVITIES:
+                    raise ValueError("Превышен лимит relevant activities")
+            if len(rows) < ACTIVITY_PAGE_SIZE:
+                break
+            if page_last <= last_id:
+                raise ValueError("Activity index не продвинул keyset cursor")
+            last_id = page_last
+        return relevant
+
+    @staticmethod
+    def _activity_list_command(deal_id: int, last_id: int) -> str:
+        fields = [
+            ("filter[BINDINGS][0][OWNER_TYPE_ID]", "2"),
+            ("filter[BINDINGS][0][OWNER_ID]", str(int(deal_id))),
+            ("filter[>ID]", str(int(last_id))),
+            ("order[ID]", "ASC"),
+            *((f"select[{index}]", field) for index, field in enumerate(ACTIVITY_INDEX_FIELDS)),
+            ("start", "0"),
+        ]
+        return "crm.activity.list?" + urlencode(fields)
+
+    def list_relevant_activities_many(
+        self,
+        deal_ids: list[int],
+    ) -> tuple[
+        dict[int, list[dict[str, Any]]],
+        dict[int, ActivityEvidenceUnavailable | ValueError],
+    ]:
+        pending = sorted({int(deal_id) for deal_id in deal_ids})
+        relevant: dict[int, list[dict[str, Any]]] = {
+            deal_id: [] for deal_id in pending
+        }
+        failures: dict[int, ActivityEvidenceUnavailable | ValueError] = {}
+        last_ids = {deal_id: 0 for deal_id in pending}
+        while pending:
+            next_pending: list[int] = []
+            for group in chunks(pending, 50):
+                fallback_all = False
+                commands = {
+                    f"activity_{offset}": self._activity_list_command(
+                        deal_id,
+                        last_ids[deal_id],
+                    )
+                    for offset, deal_id in enumerate(group)
+                }
+                try:
+                    results, errors = self._activity_batch_parts(
+                        self._activity_batch_call(commands)
+                    )
+                except StopRequested:
+                    raise
+                except ActivityEvidenceUnavailable as exc:
+                    if not exc.method_not_allowed:
+                        for deal_id in group:
+                            failures[deal_id] = exc
+                            relevant.pop(deal_id, None)
+                        continue
+                    fallback_all = True
+                    results, errors = {}, {
+                        f"activity_{offset}": {"error": "batch_method_not_allowed"}
+                        for offset, _deal_id in enumerate(group)
+                    }
+                for offset, deal_id in enumerate(group):
+                    command_name = f"activity_{offset}"
+                    if command_name in errors:
+                        error_value = errors[command_name]
+                        allow_direct_fallback = fallback_all or (
+                            self._activity_batch_error_is_method_not_allowed(
+                                error_value
+                            )
+                        )
+                        if not allow_direct_fallback:
+                            failures[deal_id] = ActivityEvidenceUnavailable(
+                                transient=is_transient_error(str(error_value))
+                            )
+                            relevant.pop(deal_id, None)
+                            continue
+                        try:
+                            relevant[deal_id] = self.list_relevant_activities(deal_id)
+                        except StopRequested:
+                            raise
+                        except ActivityEvidenceUnavailable as exc:
+                            failures[deal_id] = exc
+                            relevant.pop(deal_id, None)
+                        except ValueError:
+                            failures[deal_id] = ValueError(
+                                "Некорректный activity index"
+                            )
+                            relevant.pop(deal_id, None)
+                        continue
+                    if command_name not in results:
+                        failures[deal_id] = ActivityEvidenceUnavailable(
+                            transient=False
+                        )
+                        relevant.pop(deal_id, None)
+                        continue
+                    try:
+                        rows = self._activity_rows(results[command_name])
+                        page_last = last_ids[deal_id]
+                        for row in rows:
+                            raw_id = normalized(row.get("ID", row.get("id")))
+                            if not raw_id.isdigit() or int(raw_id) <= page_last:
+                                raise ValueError(
+                                    "Activity index нарушил keyset pagination"
+                                )
+                            page_last = int(raw_id)
+                            if activity_kind(row) is None:
+                                continue
+                            canonical_activity_index(deal_id, [row])
+                            relevant[deal_id].append(row)
+                            if len(relevant[deal_id]) > MAX_RELEVANT_ACTIVITIES:
+                                raise ValueError(
+                                    "Превышен лимит relevant activities"
+                                )
+                        if len(rows) == ACTIVITY_PAGE_SIZE:
+                            if page_last <= last_ids[deal_id]:
+                                raise ValueError(
+                                    "Activity index не продвинул keyset cursor"
+                                )
+                            last_ids[deal_id] = page_last
+                            next_pending.append(deal_id)
+                    except ValueError:
+                        failures[deal_id] = ValueError(
+                            "Некорректный activity index"
+                        )
+                        relevant.pop(deal_id, None)
+            pending = next_pending
+        return relevant, failures
+
+    @staticmethod
+    def _activity_batch_parts(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(value, dict):
+            raise ActivityEvidenceUnavailable(transient=False)
+        results = value.get("result") or {}
+        errors = value.get("result_error") or {}
+        if not isinstance(results, dict) or not isinstance(errors, dict):
+            raise ActivityEvidenceUnavailable(transient=False)
+        return results, errors
+
+    @staticmethod
+    def _activity_batch_error_is_method_not_allowed(value: Any) -> bool:
+        if isinstance(value, dict):
+            text = f"{value.get('error', '')} {value.get('error_description', '')}"
+        else:
+            text = str(value)
+        return "error_batch_method_not_allowed" in text.casefold()
+
+    def _activity_batch_call(self, commands: dict[str, str]) -> Any:
+        try:
+            return self.call("batch", {"halt": 0, "cmd": commands})
+        except StopRequested:
+            raise
+        except Exception as exc:
+            method_not_allowed = (
+                "error_batch_method_not_allowed" in str(exc).casefold()
+            )
+            raise ActivityEvidenceUnavailable(
+                transient=is_transient_error(exc),
+                method_not_allowed=method_not_allowed,
+                split_batch=is_batch_timeout_error(exc),
+            ) from None
+
+    def _fetch_activity_details_group(
+        self,
+        group: list[tuple[int, tuple[str, dict[str, Any]]]],
+    ) -> dict[int, dict[str, Any]] | None:
+        commands = {
+            f"selected_{position}": "crm.activity.get?" + urlencode(
+                [("id", normalized(row.get("ID", row.get("id"))))]
+            )
+            for position, (_kind, row) in group
+        }
+        try:
+            results, errors = self._activity_batch_parts(
+                self._activity_batch_call(commands)
+            )
+        except ActivityEvidenceUnavailable as exc:
+            if exc.split_batch and len(group) > 1:
+                midpoint = len(group) // 2
+                left = self._fetch_activity_details_group(group[:midpoint])
+                right = self._fetch_activity_details_group(group[midpoint:])
+                if left is None or right is None:
+                    return None
+                return {**left, **right}
+            raise
+        if errors:
+            if len(group) > 1 and any(
+                is_batch_timeout_error(str(value)) for value in errors.values()
+            ):
+                midpoint = len(group) // 2
+                left = self._fetch_activity_details_group(group[:midpoint])
+                right = self._fetch_activity_details_group(group[midpoint:])
+                if left is None or right is None:
+                    return None
+                return {**left, **right}
+            transient = any(is_transient_error(str(value)) for value in errors.values())
+            raise ActivityEvidenceUnavailable(transient=transient)
+        details: dict[int, dict[str, Any]] = {}
+        for position, (_kind, index_row) in group:
+            value = results.get(f"selected_{position}")
+            expected_id = normalized(index_row.get("ID", index_row.get("id")))
+            if not isinstance(value, dict) or normalized(
+                value.get("ID", value.get("id"))
+            ) != expected_id:
+                return None
+            details[position] = value
+        return details
+
+    def fetch_selected_activity_content(
+        self,
+        selected: list[tuple[str, dict[str, Any]]],
+    ) -> list[dict[str, Any]] | None:
+        if not selected:
+            return None
+        details: dict[int, dict[str, Any]] = {}
+        for group_start in range(0, len(selected), ACTIVITY_CONTENT_BATCH_SIZE):
+            group = selected[group_start:group_start + ACTIVITY_CONTENT_BATCH_SIZE]
+            indexed_group = [
+                (group_start + offset, item)
+                for offset, item in enumerate(group)
+            ]
+            group_details = self._fetch_activity_details_group(indexed_group)
+            if group_details is None:
+                return None
+            details.update(group_details)
+
+        call_positions = [
+            position for position, (kind, _row) in enumerate(selected) if kind == "call"
+        ]
+        transcripts: dict[int, object] = {}
+        if call_positions:
+            commands = {
+                f"transcript_{offset}": "crm.activity.call.getTranscript?" + urlencode(
+                    [
+                        (
+                            "activityId",
+                            normalized(selected[position][1].get(
+                                "ID", selected[position][1].get("id")
+                            )),
+                        )
+                    ]
+                )
+                for offset, position in enumerate(call_positions)
+            }
+            fallback = False
+            try:
+                results, errors = self._activity_batch_parts(
+                    self._activity_batch_call(commands)
+                )
+            except ActivityEvidenceUnavailable as exc:
+                if exc.method_not_allowed:
+                    fallback = True
+                    results, errors = {}, {}
+                else:
+                    raise
+            if errors:
+                if all(
+                    self._activity_batch_error_is_method_not_allowed(value)
+                    for value in errors.values()
+                ):
+                    fallback = True
+                else:
+                    transient = any(
+                        is_transient_error(str(value)) for value in errors.values()
+                    )
+                    raise ActivityEvidenceUnavailable(transient=transient)
+            if not fallback:
+                for offset, position in enumerate(call_positions):
+                    if f"transcript_{offset}" not in results:
+                        raise ActivityEvidenceUnavailable(transient=False)
+                    transcripts[position] = results[f"transcript_{offset}"]
+
+            for position in call_positions:
+                value = transcripts.get(position) if not fallback else None
+                attempts = 1 if not fallback else 0
+                while self._transcription_value(value) is None and attempts < 3:
+                    try:
+                        value = self.call(
+                            "crm.activity.call.getTranscript",
+                            {
+                                "activityId": normalized(
+                                    selected[position][1].get(
+                                        "ID", selected[position][1].get("id")
+                                    )
+                                )
+                            },
+                        )
+                    except StopRequested:
+                        raise
+                    except Exception as exc:
+                        raise ActivityEvidenceUnavailable(
+                            transient=is_transient_error(exc)
+                        ) from None
+                    attempts += 1
+                transcription = self._transcription_value(value)
+                if transcription is None:
+                    return None
+                transcripts[position] = transcription
+
+        result: list[dict[str, Any]] = []
+        for position, (kind, _index_row) in enumerate(selected):
+            detail = dict(details[position])
+            detail["kind"] = kind
+            if kind == "call":
+                detail["transcription"] = transcripts[position]
+            result.append(detail)
+        return result
+
+    @staticmethod
+    def _transcription_value(value: Any) -> str | None:
+        if value is None or value is False:
+            return None
+        if not isinstance(value, dict):
+            raise ActivityEvidenceUnavailable(transient=False)
+        transcription = value.get("transcription")
+        if transcription is None or transcription is False:
+            return None
+        text = str(transcription)
+        return text if text.strip() else None
+
+    def verify_activity_evidence(self, item: sqlite3.Row) -> bool:
+        deal_id = int(item["deal_id"])
+        desired = (str(item["desired_category"]), str(item["desired_subcategory"]))
+        original = (str(item["original_category"]), str(item["original_subcategory"]))
+        evidence_mode = str(item["evidence_mode"])
+        entry = self.approved_plan.entry_for_target(
+            deal_id,
+            desired,
+            evidence_mode,
+        )
+        if entry is None or not is_activity_mode(evidence_mode):
+            return False
+        try:
+            index_a_rows = self.list_relevant_activities(deal_id)
+            index_a = canonical_activity_index(deal_id, index_a_rows)
+        except ActivityEvidenceUnavailable:
+            raise
+        except ValueError:
+            return False
+        if not self.approved_plan.activity_index_guard_matches(
+            deal_id,
+            desired,
+            evidence_mode,
+            index_a,
+        ):
+            return False
+
+        locator_matches: dict[str, list[tuple[str, dict[str, Any]]]] = {
+            locator: [] for locator in entry.activity_locators
+        }
+        for row in index_a_rows:
+            kind = activity_kind(row)
+            if kind is None:
+                return False
+            try:
+                locator = activity_locator_fingerprint(
+                    self.approved_plan.key,
+                    deal_id,
+                    kind,
+                    normalized(row.get("ID", row.get("id"))),
+                )
+            except ValueError:
+                return False
+            if locator in locator_matches:
+                locator_matches[locator].append((kind, row))
+        if any(len(matches) != 1 for matches in locator_matches.values()):
+            return False
+        selected = [
+            locator_matches[locator][0] for locator in entry.activity_locators
+        ]
+        selected_content = self.fetch_selected_activity_content(selected)
+        if selected_content is None:
+            return False
+        try:
+            index_b_rows = self.list_relevant_activities(deal_id)
+            index_b = canonical_activity_index(deal_id, index_b_rows)
+        except ActivityEvidenceUnavailable:
+            raise
+        except ValueError:
+            return False
+        if not hmac.compare_digest(index_a.encode("utf-8"), index_b.encode("utf-8")):
+            return False
+        if not self.approved_plan.activity_index_guard_matches(
+            deal_id,
+            desired,
+            evidence_mode,
+            index_b,
+        ):
+            return False
+        try:
+            evidence = canonical_activity_evidence(
+                deal_id,
+                index_b_rows,
+                selected_content,
+            )
+        except ValueError:
+            return False
+        return self.approved_plan.approves_transition(
+            deal_id,
+            original,
+            desired,
+            evidence_mode,
+            evidence,
+        )
+
     def classify_live(
         self,
         item: sqlite3.Row,
         live: tuple[str, str, str, str, str] | None,
         product_evidence: str | None = None,
+        activity_evidence_verified: bool | None = None,
     ) -> str:
         if live is None:
             return "missing"
@@ -709,6 +1217,8 @@ class PrecisionWorker:
         if current != original:
             return "conflict"
         evidence_kind = base_evidence_mode(evidence_mode)
+        if evidence_kind == "activities":
+            return "write" if activity_evidence_verified else "evidence_pending"
         if evidence_kind == "title":
             evidence = live[3]
         elif evidence_kind == "deal_text":
@@ -760,7 +1270,7 @@ class PrecisionWorker:
                 deal_id = int(row["deal_id"])
                 deal_live = live.get(deal_id)
                 state = self.classify_live(row, deal_live, products.get(deal_id))
-                if state == "write":
+                if state in {"write", "evidence_pending"}:
                     state = "pending"
                 self.set_queue_status(
                     deal_id,
@@ -808,21 +1318,172 @@ class PrecisionWorker:
         self.wait_for_write_slot()
         if time.time() - self.metadata_resolved_at >= 900:
             self.resolve_metadata()
+
+        activity_rows = [
+            row for row in rows if is_activity_mode(str(row["evidence_mode"]))
+        ]
+        activity_verified: set[int] = set()
+        deferred_ids: set[int] = set()
+        if activity_rows:
+            activity_rows = activity_rows[:MAX_ACTIVITY_ROWS_PER_WRITE]
+            selected_activity_ids = {
+                int(row["deal_id"]) for row in activity_rows
+            }
+            # Keep activity evidence close to its write. Other rows remain
+            # pending for the next slice instead of lengthening the raw-body
+            # race window for this bounded activity group.
+            deferred_ids.update(
+                int(row["deal_id"])
+                for row in rows
+                if int(row["deal_id"]) not in selected_activity_ids
+            )
+            # A cheap current-deal preflight prevents sensitive activity reads
+            # for rows that are already terminal. A second authoritative deal
+            # snapshot is still fetched after the activity A/content/B guard.
+            preflight = self.fetch_live(
+                [int(row["deal_id"]) for row in activity_rows]
+            )
+            for row in activity_rows:
+                deal_id = int(row["deal_id"])
+                deal_live = preflight.get(deal_id)
+                state = self.classify_live(row, deal_live)
+                if state != "evidence_pending":
+                    self.set_queue_status(
+                        deal_id,
+                        state,
+                        stage_id=deal_live[2] if deal_live else "",
+                    )
+                    deferred_ids.add(deal_id)
+                    continue
+                try:
+                    evidence_matches = self.verify_activity_evidence(row)
+                except StopRequested:
+                    raise
+                except ActivityEvidenceUnavailable as exc:
+                    attempts = int(row["attempts"]) + 1
+                    if exc.transient:
+                        delay = retry_delay(attempts)
+                        self.set_queue_status(
+                            deal_id,
+                            "retry_wait",
+                            attempts=attempts,
+                            next_attempt_at=time.time() + delay,
+                            error="Activity evidence временно недоступно",
+                            stage_id=deal_live[2] if deal_live else "",
+                        )
+                    else:
+                        self.set_queue_status(
+                            deal_id,
+                            "permanent_error",
+                            attempts=attempts,
+                            error="Activity evidence недоступно",
+                            stage_id=deal_live[2] if deal_live else "",
+                        )
+                    deferred_ids.add(deal_id)
+                    continue
+                if not evidence_matches:
+                    self.set_queue_status(
+                        deal_id,
+                        "conflict",
+                        stage_id=deal_live[2] if deal_live else "",
+                    )
+                    deferred_ids.add(deal_id)
+                    continue
+                activity_verified.add(deal_id)
+
+        guard_rows = [row for row in rows if int(row["deal_id"]) not in deferred_ids]
         products = self.fetch_product_evidence(
             [
                 int(row["deal_id"])
-                for row in rows
+                for row in guard_rows
                 if base_evidence_mode(str(row["evidence_mode"])) == "products"
             ]
         )
+        final_activity_rows = [
+            row
+            for row in guard_rows
+            if int(row["deal_id"]) in activity_verified
+        ]
+        if final_activity_rows:
+            final_indexes, final_errors = self.list_relevant_activities_many(
+                [int(row["deal_id"]) for row in final_activity_rows]
+            )
+            for row in final_activity_rows:
+                deal_id = int(row["deal_id"])
+                final_error = final_errors.get(deal_id)
+                if isinstance(final_error, ActivityEvidenceUnavailable):
+                    attempts = int(row["attempts"]) + 1
+                    if final_error.transient:
+                        delay = retry_delay(attempts)
+                        self.set_queue_status(
+                            deal_id,
+                            "retry_wait",
+                            attempts=attempts,
+                            next_attempt_at=time.time() + delay,
+                            error="Activity evidence временно недоступно",
+                            stage_id=str(row["stage_id"]),
+                        )
+                    else:
+                        self.set_queue_status(
+                            deal_id,
+                            "permanent_error",
+                            attempts=attempts,
+                            error="Activity evidence недоступно",
+                            stage_id=str(row["stage_id"]),
+                        )
+                    deferred_ids.add(deal_id)
+                    continue
+                if final_error is not None:
+                    self.set_queue_status(
+                        deal_id,
+                        "conflict",
+                        stage_id=str(row["stage_id"]),
+                    )
+                    deferred_ids.add(deal_id)
+                    continue
+                try:
+                    final_index = canonical_activity_index(
+                        deal_id,
+                        final_indexes[deal_id],
+                    )
+                except (KeyError, ValueError):
+                    final_index = ""
+                desired = (
+                    str(row["desired_category"]),
+                    str(row["desired_subcategory"]),
+                )
+                if not final_index or not self.approved_plan.activity_index_guard_matches(
+                    deal_id,
+                    desired,
+                    str(row["evidence_mode"]),
+                    final_index,
+                ):
+                    self.set_queue_status(
+                        deal_id,
+                        "conflict",
+                        stage_id=str(row["stage_id"]),
+                    )
+                    deferred_ids.add(deal_id)
+            guard_rows = [
+                row
+                for row in guard_rows
+                if int(row["deal_id"]) not in deferred_ids
+            ]
         # Stage and category fields are fetched last, immediately before the
         # write decision, so metadata/evidence reads cannot stale this guard.
-        live = self.fetch_live([int(row["deal_id"]) for row in rows])
+        live = self.fetch_live([int(row["deal_id"]) for row in guard_rows])
         writable: list[sqlite3.Row] = []
-        for row in rows:
+        for row in guard_rows:
             deal_id = int(row["deal_id"])
             deal_live = live.get(deal_id)
-            state = self.classify_live(row, deal_live, products.get(deal_id))
+            state = self.classify_live(
+                row,
+                deal_live,
+                products.get(deal_id),
+                activity_evidence_verified=(
+                    True if deal_id in activity_verified else None
+                ),
+            )
             if state == "write":
                 writable.append(row)
                 self.set_queue_status(deal_id, "inflight", stage_id=deal_live[2])
