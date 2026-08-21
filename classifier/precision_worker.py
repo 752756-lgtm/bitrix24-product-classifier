@@ -134,10 +134,12 @@ def chunks(values: Iterable[Any], size: int) -> Iterable[list[Any]]:
 
 def is_transient_error(exc: BaseException | str) -> bool:
     text = str(exc).casefold()
+    # HTTPError inherits URLError. Check it first so permanent 4xx responses
+    # are not retried as network failures.
+    if isinstance(exc, HTTPError):
+        return exc.code in {408, 409, 429} or 500 <= exc.code < 600
     if isinstance(exc, (TimeoutError, URLError)):
         return True
-    if isinstance(exc, HTTPError):
-        return exc.code == 429 or 500 <= exc.code < 600
     return any(
         marker in text
         for marker in (
