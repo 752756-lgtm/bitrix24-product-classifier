@@ -1,0 +1,9 @@
+prepare-activity-plan-2025
+mode=auto-resolve-terminal-writer
+max_deals=250
+skip_remaining=244
+model_workers=1
+deterministic_only=false
+include_category_present=false
+retry=1
+one_shot=true
