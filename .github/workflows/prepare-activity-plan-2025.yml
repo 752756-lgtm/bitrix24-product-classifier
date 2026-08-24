@@ -17,6 +17,11 @@ on:
         required: true
         default: "0"
         type: string
+      model_workers:
+        description: "Concurrent model requests; keep 1 for rate-limit-safe bounded runs"
+        required: true
+        default: "1"
+        type: string
       deterministic_only:
         description: "Skip OpenAI; defer rows not accepted by strict deterministic rules"
         required: true
@@ -120,6 +125,7 @@ jobs:
         env:
           MAX_DEALS: ${{ inputs.max_deals }}
           SKIP_REMAINING: ${{ inputs.skip_remaining }}
+          MODEL_WORKERS: ${{ inputs.model_workers }}
           DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -132,6 +138,10 @@ jobs:
           fi
           if [[ ! "${SKIP_REMAINING}" =~ ^[0-9]+$ ]]; then
             echo "::error::skip_remaining must be a non-negative integer"
+            exit 1
+          fi
+          if [[ ! "${MODEL_WORKERS}" =~ ^[1-5]$ ]]; then
+            echo "::error::model_workers must be an integer from 1 through 5"
             exit 1
           fi
           missing=0
@@ -183,6 +193,7 @@ jobs:
         env:
           MAX_DEALS: ${{ inputs.max_deals }}
           SKIP_REMAINING: ${{ inputs.skip_remaining }}
+          MODEL_WORKERS: ${{ inputs.model_workers }}
           DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
           INCLUDE_CATEGORY_PRESENT: ${{ inputs.include_category_present }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
@@ -200,7 +211,7 @@ jobs:
             --diagnostics "${PRIVATE_DIAGNOSTICS}"
             --max-deals "${MAX_DEALS}"
             --skip-remaining "${SKIP_REMAINING}"
-            --model-workers 5
+            --model-workers "${MODEL_WORKERS}"
             --api-call-cap 12000
             --parent-map classifier/data/precision-2025-parent-map.json
           )
