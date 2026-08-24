@@ -22,14 +22,6 @@ on:
         required: true
         default: false
         type: boolean
-  # Temporary one-shot bridge for environments that cannot dispatch a
-  # workflow with inputs. The push gate below requires a newly added,
-  # byte-exact marker and rejects both re-runs and marker deletion.
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflow-triggers/prepare-activity-plan-2025-bounded-250.trigger"
 
 permissions:
   contents: read
@@ -43,9 +35,6 @@ concurrency:
 
 jobs:
   prepare:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
@@ -56,13 +45,6 @@ jobs:
       OPENAI_MODEL: gpt-5.6-luna
       ACTIVITY_PREP_HTTP_TIMEOUT: "90"
       ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
-      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2025-bounded-250.trigger
-      ONE_SHOT_MARKER_SHA256: 0ad70009e11d0a86ae619f9829cf1e2be3022280e03b828fd11f9cc25fa655a2
-      INVOCATION_MODE: ${{ github.event_name == 'push' && 'one_shot' || 'manual' }}
-      EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.writer_run_id || '' }}
-      MAX_DEALS: ${{ github.event_name == 'push' && '250' || inputs.max_deals }}
-      DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'false' || inputs.deterministic_only }}
-      INCLUDE_CATEGORY_PRESENT: ${{ github.event_name == 'push' && 'false' || inputs.include_category_present }}
     steps:
       - name: Checkout main without persisted credentials
         uses: actions/checkout@v4
@@ -71,124 +53,30 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fail closed unless this is an exact authorized invocation
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
-            echo "::error::Preparation workflow is restricted to main"
-            exit 1
-          fi
-          if [ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]; then
-            echo "::error::main advanced before checkout; refusing a stale invocation"
-            exit 1
-          fi
-          if [[ ! "${MAX_DEALS}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Effective max_deals is malformed"
-            exit 1
-          fi
-          case "${DETERMINISTIC_ONLY}:${INCLUDE_CATEGORY_PRESENT}" in
-            true:true|true:false|false:true|false:false)
-              ;;
-            *)
-              echo "::error::Effective boolean inputs are malformed"
-              exit 1
-              ;;
-          esac
-
-          case "${GITHUB_EVENT_NAME}:${INVOCATION_MODE}" in
-            workflow_dispatch:manual)
-              if [[ ! "${EXPECTED_WRITER_RUN_ID}" =~ ^[0-9]+$ ]]; then
-                echo "::error::writer_run_id must be numeric for manual dispatch"
-                exit 1
-              fi
-              ;;
-            push:one_shot)
-              if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
-                echo "::error::The temporary one-shot push cannot be re-run"
-                exit 1
-              fi
-              if [ -n "${EXPECTED_WRITER_RUN_ID}" ] || \
-                 [ "${MAX_DEALS}:${DETERMINISTIC_ONLY}:${INCLUDE_CATEGORY_PRESENT}" != \
-                   "250:false:false" ]; then
-                echo "::error::The one-shot push has unexpected effective inputs"
-                exit 1
-              fi
-              before="$({ python - "${GITHUB_EVENT_PATH}" "${GITHUB_SHA}" <<'PY'
-          import json
-          import re
-          import sys
-          from pathlib import Path
-
-          event = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected_after = sys.argv[2]
-          before = event.get("before")
-          after = event.get("after")
-          if event.get("ref") != "refs/heads/main":
-              raise SystemExit("Push payload is not for main")
-          if event.get("deleted") is not False or event.get("forced") is not False:
-              raise SystemExit("Deleted or forced pushes are not authorized")
-          if "inputs" in event:
-              raise SystemExit("Push payload unexpectedly contains dispatch inputs")
-          if not isinstance(before, str) or not re.fullmatch(r"[0-9a-f]{40}", before):
-              raise SystemExit("Push payload has a malformed before SHA")
-          if before == "0" * 40:
-              raise SystemExit("Branch-creation pushes are not authorized")
-          if after != expected_after:
-              raise SystemExit("Push payload after SHA does not match GITHUB_SHA")
-          print(before)
-          PY
-              } 2>&1)" || {
-                echo "::error::Push payload failed the one-shot safety gate"
-                exit 1
-              }
-              if ! git cat-file -e "${before}^{commit}" 2>/dev/null || \
-                 ! git merge-base --is-ancestor "${before}" "${GITHUB_SHA}"; then
-                echo "::error::Push predecessor is unavailable or not an ancestor"
-                exit 1
-              fi
-              if git cat-file -e "${before}:${ONE_SHOT_MARKER_PATH}" 2>/dev/null; then
-                echo "::error::One-shot marker already existed before this push"
-                exit 1
-              fi
-              marker_change="$(git diff --name-status --no-renames \
-                "${before}" "${GITHUB_SHA}" -- "${ONE_SHOT_MARKER_PATH}")"
-              if [ "${marker_change}" != $'A\t'"${ONE_SHOT_MARKER_PATH}" ]; then
-                echo "::error::One-shot marker was not newly added by this push"
-                exit 1
-              fi
-              if [ ! -f "${ONE_SHOT_MARKER_PATH}" ] || [ -L "${ONE_SHOT_MARKER_PATH}" ]; then
-                echo "::error::One-shot marker is missing or not a regular file"
-                exit 1
-              fi
-              marker_sha256="$(sha256sum -- "${ONE_SHOT_MARKER_PATH}" | cut -d' ' -f1)"
-              if [ "${marker_sha256}" != "${ONE_SHOT_MARKER_SHA256}" ]; then
-                echo "::error::One-shot marker content does not match the authorized payload"
-                exit 1
-              fi
-              ;;
-            *)
-              echo "::error::Unsupported workflow invocation"
-              exit 1
-              ;;
-          esac
-
-      - name: Require terminal current writer plan
+      - name: Require main dispatch and terminal current writer plan
         env:
+          EXPECTED_WRITER_RUN_ID: ${{ inputs.writer_run_id }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -Eeuo pipefail
           if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
-            echo "::error::Preparation workflow must run from main"
+            echo "::error::Preparation workflow must be dispatched from main"
+            exit 1
+          fi
+          if [[ ! "${EXPECTED_WRITER_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::writer_run_id must be numeric"
             exit 1
           fi
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
           auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
           exact="${RUNNER_TEMP}/writer-run.json"
-          candidates="${RUNNER_TEMP}/writer-success-candidates.json"
-          tag_ref="${RUNNER_TEMP}/writer-completion-tag.json"
+          active="${RUNNER_TEMP}/writer-active.json"
           umask 077
+          curl -fsSL "${auth[@]}" "${api}/actions/runs/${EXPECTED_WRITER_RUN_ID}" > "${exact}"
+          curl -fsSL "${auth[@]}" \
+            "${api}/actions/workflows/precision-backfill-2025.yml/runs?branch=main&status=in_progress&per_page=1" \
+            > "${active}"
           fingerprint="$({
             sha256sum classifier/precision_worker.py
             sha256sum classifier/precision_plan.py
@@ -198,68 +86,35 @@ jobs:
             sha256sum classifier/data/precision-2025-taxonomy.json
           } | sha256sum | cut -d' ' -f1)"
           completion_marker="precision-2025-complete-${fingerprint}"
-          if ! curl -fsSL "${auth[@]}" \
-            "${api}/git/ref/tags/${completion_marker}" > "${tag_ref}"; then
+          if ! git ls-remote --exit-code --refs --tags \
+            origin "refs/tags/${completion_marker}" >/dev/null; then
             echo "::error::Current writer and signed plan have no terminal completion marker"
             exit 1
           fi
+          python - "${exact}" "${active}" "${EXPECTED_WRITER_RUN_ID}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
 
-          case "${INVOCATION_MODE}" in
-            manual)
-              curl -fsSL "${auth[@]}" \
-                "${api}/actions/runs/${EXPECTED_WRITER_RUN_ID}" > "${exact}"
-              ;;
-            one_shot)
-              curl -fsSL "${auth[@]}" \
-                "${api}/actions/workflows/precision-backfill-2025.yml/runs?branch=main&status=success&exclude_pull_requests=true&per_page=100" \
-                > "${candidates}"
-              ;;
-            *)
-              echo "::error::Unsupported writer resolution mode"
-              exit 1
-              ;;
-          esac
-
-          active_files=()
-          for writer_status in in_progress queued requested waiting pending; do
-            active_path="${RUNNER_TEMP}/writer-active-${writer_status}.json"
-            curl -fsSL "${auth[@]}" \
-              "${api}/actions/workflows/precision-backfill-2025.yml/runs?branch=main&status=${writer_status}&exclude_pull_requests=true&per_page=1" \
-              > "${active_path}"
-            active_files+=("${active_path}")
-          done
-
-          resolver_args=(
-            --mode "${INVOCATION_MODE}"
-            --expected-run-id "${EXPECTED_WRITER_RUN_ID}"
-            --marker "${completion_marker}"
-            --tag-json "${tag_ref}"
-            --exact-json "${exact}"
-            --candidates-json "${candidates}"
-          )
-          for active_path in "${active_files[@]}"; do
-            resolver_args+=(--active-json "${active_path}")
-          done
-          resolution="$(python -m tools.resolve_terminal_writer \
-            "${resolver_args[@]}")" || {
-            echo "::error::Could not resolve an exact terminal current writer"
-            exit 1
-          }
-          IFS=$'\t' read -r resolved_writer_run_id tag_target_sha <<< "${resolution}"
-          if [[ ! "${resolved_writer_run_id}" =~ ^[0-9]+$ ]] || \
-             [[ ! "${tag_target_sha}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Resolved writer identity is malformed"
-            exit 1
-          fi
-          if ! git cat-file -e "${tag_target_sha}^{commit}" 2>/dev/null || \
-             ! git merge-base --is-ancestor "${tag_target_sha}" "${GITHUB_SHA}"; then
-            echo "::error::Completion marker target is not an ancestor of this main revision"
-            exit 1
-          fi
-          echo "Resolved terminal writer run ${resolved_writer_run_id} for the exact current fingerprint"
+          exact = json.loads(Path(sys.argv[1]).read_text())
+          active = json.loads(Path(sys.argv[2]).read_text()).get("workflow_runs", [])
+          expected = int(sys.argv[3])
+          if (
+              exact.get("id") != expected
+              or exact.get("status") != "completed"
+              or exact.get("conclusion") != "success"
+              or exact.get("head_branch") != "main"
+              or exact.get("path") != ".github/workflows/precision-backfill-2025.yml"
+          ):
+              raise SystemExit("Writer run is not a completed successful main run")
+          if active:
+              raise SystemExit("A precision writer is still active")
+          PY
 
       - name: Validate inputs and required secrets
         env:
+          MAX_DEALS: ${{ inputs.max_deals }}
+          DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         shell: bash
@@ -316,8 +171,11 @@ jobs:
 
       - name: Fresh read-only activity preparation
         env:
+          MAX_DEALS: ${{ inputs.max_deals }}
+          DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
+          INCLUDE_CATEGORY_PRESENT: ${{ inputs.include_category_present }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
-          OPENAI_API_KEY: ${{ (github.event_name == 'push' || !inputs.deterministic_only) && secrets.OPENAI_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ !inputs.deterministic_only && secrets.OPENAI_API_KEY || '' }}
         shell: bash
         run: |
           set -Eeuo pipefail
