@@ -12,6 +12,11 @@ on:
         required: true
         default: "30"
         type: string
+      skip_remaining:
+        description: "Eligible incomplete deals to skip before taking the bounded slice"
+        required: true
+        default: "0"
+        type: string
       deterministic_only:
         description: "Skip OpenAI; defer rows not accepted by strict deterministic rules"
         required: true
@@ -114,6 +119,7 @@ jobs:
       - name: Validate inputs and required secrets
         env:
           MAX_DEALS: ${{ inputs.max_deals }}
+          SKIP_REMAINING: ${{ inputs.skip_remaining }}
           DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -122,6 +128,10 @@ jobs:
           set -Eeuo pipefail
           if [[ ! "${MAX_DEALS}" =~ ^[0-9]+$ ]]; then
             echo "::error::max_deals must be a non-negative integer"
+            exit 1
+          fi
+          if [[ ! "${SKIP_REMAINING}" =~ ^[0-9]+$ ]]; then
+            echo "::error::skip_remaining must be a non-negative integer"
             exit 1
           fi
           missing=0
@@ -172,6 +182,7 @@ jobs:
       - name: Fresh read-only activity preparation
         env:
           MAX_DEALS: ${{ inputs.max_deals }}
+          SKIP_REMAINING: ${{ inputs.skip_remaining }}
           DETERMINISTIC_ONLY: ${{ inputs.deterministic_only }}
           INCLUDE_CATEGORY_PRESENT: ${{ inputs.include_category_present }}
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
@@ -188,6 +199,7 @@ jobs:
             --status "${PRIVATE_STATUS}"
             --diagnostics "${PRIVATE_DIAGNOSTICS}"
             --max-deals "${MAX_DEALS}"
+            --skip-remaining "${SKIP_REMAINING}"
             --model-workers 5
             --api-call-cap 12000
             --parent-map classifier/data/precision-2025-parent-map.json
@@ -424,7 +436,8 @@ jobs:
           scope = status["scope"]
           accepted = stats["accepted_full_pair"] + stats["accepted_category_only"]
           scope_text = (
-              f"bounded partial scope: first {scope['max_deals']} remaining deals"
+              f"bounded partial scope: {scope['max_deals']} remaining deals "
+              f"after skipping {scope['skip_remaining']} earlier eligible deals"
               if scope["partial"]
               else (
                   "complete fresh-year incomplete-classification scope "
@@ -441,6 +454,7 @@ jobs:
           - full pair: {stats['accepted_full_pair']}
           - category only: {stats['accepted_category_only']}
           - remaining scope scanned: {stats['remaining']}
+          - earlier eligible deals skipped: {stats['skipped_remaining']}
           - Bitrix API calls/cap: {stats['bitrix_api_calls']}/{stats['bitrix_api_call_cap']}
           - peak projected calls before final guards: {stats['projected_api_calls']}
           - excluded stages honored across all funnels
@@ -498,13 +512,15 @@ jobs:
           print(f"- Full pair: {stats['accepted_full_pair']}")
           print(f"- Category only: {stats['accepted_category_only']}")
           print(f"- Remaining scope: {stats['remaining']}")
+          print(f"- Earlier eligible deals skipped: {stats['skipped_remaining']}")
           print(
               f"- Bitrix API calls/cap: {stats['bitrix_api_calls']}/"
               f"{stats['bitrix_api_call_cap']}"
           )
           print(f"- Peak projected calls: {stats['projected_api_calls']}")
           print(
-              f"- Scope: bounded partial first {scope['max_deals']} remaining deals"
+              f"- Scope: bounded partial {scope['max_deals']} remaining deals "
+              f"after skipping {scope['skip_remaining']} earlier eligible deals"
               if scope["partial"]
               else (
                   "- Scope: complete fresh-year incomplete-classification scan "

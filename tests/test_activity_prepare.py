@@ -24,6 +24,7 @@ from classifier.activity_prepare import (
     DeferredEvidence,
     LiveTaxonomy,
     OpenAIActivityClassifier,
+    PreparationError,
     PreparationStats,
     ReliableBitrix,
     SafePreparationDiagnostics,
@@ -454,12 +455,49 @@ class ActivityPreparationTests(unittest.TestCase):
                     complete_stats,
                     taxonomy=taxonomy(),
                     scope_limit=10,
+                    skip_remaining=0,
                     include_category_present=True,
                 )
                 scope = read_private_json(status_path)["scope"]
         self.assertFalse(scope["partial"])
         self.assertTrue(scope["complete"])
+        self.assertEqual(scope["skip_remaining"], 0)
         self.assertTrue(scope["include_category_present"])
+
+    def test_bounded_scan_can_skip_an_exact_eligible_prefix(self):
+        rows = [
+            {
+                "ID": str(deal_id),
+                "STAGE_ID": "NEW",
+                "TITLE": f"remaining {deal_id}",
+                CATEGORY_FIELD: "",
+                SUBCATEGORY_FIELD: "",
+            }
+            for deal_id in (1, 2, 3, 4)
+        ]
+        stats = PreparationStats()
+        deals = scan_remaining_deals(
+            ScanBitrix(rows),
+            year=2025,
+            excluded_stage_ids=set(),
+            stats=stats,
+            skip_remaining=2,
+            max_deals=1,
+        )
+        self.assertEqual([deal.deal_id for deal in deals], [3])
+        self.assertEqual(stats.skipped_remaining, 2)
+        self.assertEqual(stats.remaining, 1)
+        self.assertEqual(stats.scope_complete, 0)
+
+        with self.assertRaises(PreparationError):
+            scan_remaining_deals(
+                ScanBitrix(rows),
+                year=2025,
+                excluded_stage_ids=set(),
+                stats=PreparationStats(),
+                skip_remaining=5,
+                max_deals=1,
+            )
 
     def test_classifier_text_removes_html_quotes_and_direct_pii(self):
         value = (
@@ -1114,6 +1152,10 @@ class ActivityPreparationTests(unittest.TestCase):
         self.assertIn('completion_marker="precision-2025-complete-${fingerprint}"', workflow)
         self.assertIn("Current writer and signed plan have no terminal completion marker", workflow)
         self.assertNotIn("A different precision writer run is now latest", workflow)
+        self.assertIn("      skip_remaining:\n", workflow)
+        self.assertIn("SKIP_REMAINING: ${{ inputs.skip_remaining }}", workflow)
+        self.assertIn('--skip-remaining "${SKIP_REMAINING}"', workflow)
+        self.assertIn("scope['skip_remaining']", workflow)
         self.assertIn('scope["include_category_present"]', workflow)
         self.assertIn("main advanced before plan publication", workflow)
         self.assertIn("main advanced before draft PR creation", workflow)

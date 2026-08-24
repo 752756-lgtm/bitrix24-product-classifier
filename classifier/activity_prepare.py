@@ -297,6 +297,7 @@ class PreparationStats:
     excluded_stage: int = 0
     complete_fields: int = 0
     category_present: int = 0
+    skipped_remaining: int = 0
     remaining: int = 0
     no_activity: int = 0
     no_content: int = 0
@@ -442,6 +443,7 @@ def preparation_scope_digest(
     *,
     year: int,
     max_deals: int,
+    skip_remaining: int,
     include_category_present: bool,
     deterministic_only: bool,
     model: str,
@@ -450,6 +452,7 @@ def preparation_scope_digest(
     payload = {
         "year": year,
         "max_deals": max_deals,
+        "skip_remaining": skip_remaining,
         "include_category_present": include_category_present,
         "deterministic_only": deterministic_only,
         "model": model,
@@ -687,11 +690,14 @@ def scan_remaining_deals(
     excluded_stage_ids: set[str],
     stats: PreparationStats,
     max_deals: int = 0,
+    skip_remaining: int = 0,
     include_category_present: bool = False,
 ) -> list[DealSnapshot]:
+    if skip_remaining < 0:
+        raise PreparationError("skip_remaining не может быть отрицательным")
     last_id = 0
     result: list[DealSnapshot] = []
-    omitted_by_limit = False
+    omitted_by_limit = bool(skip_remaining)
     while True:
         rows = bitrix.call(
             "crm.deal.list",
@@ -733,6 +739,9 @@ def scan_remaining_deals(
             if category_id and not include_category_present:
                 stats.category_present += 1
                 continue
+            if stats.skipped_remaining < skip_remaining:
+                stats.skipped_remaining += 1
+                continue
             if max_deals and len(result) >= max_deals:
                 omitted_by_limit = True
             else:
@@ -747,6 +756,10 @@ def scan_remaining_deals(
                 )
                 stats.remaining += 1
         if len(rows) < 50:
+            if stats.skipped_remaining != skip_remaining:
+                raise PreparationError(
+                    "skip_remaining превышает доступную неполную область"
+                )
             stats.scope_complete = int(not omitted_by_limit)
             return result
         if page_last <= last_id:
@@ -2729,6 +2742,7 @@ def _write_status(
     *,
     taxonomy: LiveTaxonomy,
     scope_limit: int,
+    skip_remaining: int,
     include_category_present: bool,
 ) -> None:
     atomic_private_json(
@@ -2737,6 +2751,7 @@ def _write_status(
             "format": "bitrix24-activity-preparation-summary-v1",
             "scope": {
                 "max_deals": max(0, int(scope_limit)),
+                "skip_remaining": max(0, int(skip_remaining)),
                 "partial": not bool(stats.scope_complete),
                 "complete": bool(stats.scope_complete),
                 "include_category_present": bool(include_category_present),
@@ -2834,6 +2849,7 @@ def run_preparation(
         excluded_stage_ids=excluded_stages,
         stats=stats,
         max_deals=max(0, args.max_deals),
+        skip_remaining=args.skip_remaining,
         include_category_present=args.include_category_present,
     )
     run_identity = ":".join(
@@ -2846,6 +2862,7 @@ def run_preparation(
         deals,
         year=args.year,
         max_deals=max(0, args.max_deals),
+        skip_remaining=args.skip_remaining,
         include_category_present=args.include_category_present,
         deterministic_only=args.deterministic_only,
         model=model,
@@ -2895,6 +2912,7 @@ def run_preparation(
         pipeline.stats,
         taxonomy=taxonomy,
         scope_limit=args.max_deals,
+        skip_remaining=args.skip_remaining,
         include_category_present=args.include_category_present,
     )
     diagnostics.succeed()
@@ -2919,6 +2937,7 @@ def main() -> None:
     parser.add_argument("--diagnostics", required=True)
     parser.add_argument("--parent-map", default=str(DEFAULT_PARENT_MAP))
     parser.add_argument("--max-deals", type=int, default=0)
+    parser.add_argument("--skip-remaining", type=int, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=10)
     parser.add_argument("--model-workers", type=int, default=5)
     parser.add_argument("--api-call-cap", type=int, default=12_000)
