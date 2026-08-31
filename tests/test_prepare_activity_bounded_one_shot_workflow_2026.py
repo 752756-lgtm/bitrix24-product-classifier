@@ -1,4 +1,5 @@
 import hashlib
+import json
 import unittest
 from pathlib import Path
 
@@ -7,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github/workflows/prepare-activity-plan-2026.yml"
 MARKER_RELATIVE = Path(
     ".github/workflow-triggers/"
-    "prepare-activity-plan-2026-bounded-500-skip-0.trigger"
+    "prepare-activity-plan-2026-bounded-500-skip-0-retry-1.trigger"
 )
 MARKER_PATH = ROOT / MARKER_RELATIVE
-MARKER_SHA256 = "c7f891e457e287bc67d4f5417ad59c6264fdc400f93081dad697e91afe988f48"
+MARKER_SHA256 = "2d6fbfa16b9b291b7237861f35fd6b4e1502ef2e6a99420a1c43e3afbf582e72"
 
 
 class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
@@ -44,7 +45,8 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
             b"model_workers=1\n"
             b"deterministic_only=false\n"
             b"include_category_present=false\n"
-            b"one_shot=true\n",
+            b"one_shot=true\n"
+            b"retry=1\n",
         )
         self.assertEqual(hashlib.sha256(MARKER_PATH.read_bytes()).hexdigest(), MARKER_SHA256)
         self.assertIn(f"ONE_SHOT_MARKER_SHA256: {MARKER_SHA256}", self.workflow)
@@ -162,6 +164,14 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
             "PRECISION_TAXONOMY_PATH: classifier/data/precision-2026-taxonomy.json",
             writer,
         )
+
+    def test_2026_parent_map_is_bound_to_2026(self):
+        parent_map = json.loads(
+            (ROOT / "classifier/data/precision-2026-parent-map.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(parent_map["year"], 2026)
 
 
 if __name__ == "__main__":
