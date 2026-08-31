@@ -1148,7 +1148,7 @@ class ActivityPreparationTests(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / ".github/workflows/prepare-activity-plan-2025.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn("group: bitrix24-category-backfill-2025-hosted", workflow)
+        self.assertIn("group: bitrix24-category-backfill-global-hosted", workflow)
         self.assertIn('completion_marker="precision-2025-complete-${fingerprint}"', workflow)
         self.assertIn("Current writer and signed plan have no terminal completion marker", workflow)
         self.assertNotIn("A different precision writer run is now latest", workflow)
