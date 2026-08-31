@@ -1,16 +1,11 @@
-name: Backfill Bitrix24 categories for 2025
+name: Backfill Bitrix24 categories for 2026
 
 on:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/precision-backfill-2025.yml"
-      - "classifier/precision_worker.py"
-      - "classifier/precision_plan.py"
-      - "classifier/bitrix.py"
-      - "classifier/http.py"
-      - "classifier/data/precision-2025.allowlist"
-      - "classifier/data/precision-2025-taxonomy.json"
+      - "classifier/data/precision-2026.allowlist"
+      - "classifier/data/precision-2026-taxonomy.json"
   workflow_dispatch:
     inputs:
       slice:
@@ -18,8 +13,6 @@ on:
         required: false
         type: number
         default: 0
-  schedule:
-    - cron: "17 * * * *"
 
 permissions:
   contents: read
@@ -66,10 +59,10 @@ jobs:
             sha256sum classifier/precision_plan.py
             sha256sum classifier/bitrix.py
             sha256sum classifier/http.py
-            sha256sum classifier/data/precision-2025.allowlist
-            sha256sum classifier/data/precision-2025-taxonomy.json
+            sha256sum classifier/data/precision-2026.allowlist
+            sha256sum classifier/data/precision-2026-taxonomy.json
           } | sha256sum | cut -d' ' -f1)"
-          marker="precision-2025-complete-${fingerprint}"
+          marker="precision-2026-complete-${fingerprint}"
           printf 'name=%s\n' "${marker}" >> "${GITHUB_OUTPUT}"
           if git ls-remote --exit-code --refs --tags origin "refs/tags/${marker}" >/dev/null; then
             printf 'complete=true\n' >> "${GITHUB_OUTPUT}"
@@ -296,7 +289,9 @@ jobs:
       exit_code: ${{ steps.processing.outputs.exit_code }}
       terminal_complete: ${{ steps.processing.outputs.terminal_complete }}
     env:
-      PRECISION_YEAR: "2025"
+      PRECISION_YEAR: "2026"
+      PRECISION_ALLOWLIST_PATH: classifier/data/precision-2026.allowlist
+      PRECISION_TAXONOMY_PATH: classifier/data/precision-2026-taxonomy.json
       PRECISION_BATCH_SIZE: "20"
       PRECISION_WRITE_INTERVAL_SECONDS: "60"
       PRECISION_API_INTERVAL_SECONDS: "1.2"
@@ -385,7 +380,7 @@ jobs:
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
               output.write(f"terminal_complete={'true' if complete else 'false'}\n")
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
-              output.write("## Bitrix24 backfill 2025\n\n")
+              output.write("## Bitrix24 backfill 2026\n\n")
               for name, value in summary.items():
                   if name != "queue":
                       output.write(f"- {name}: {value}\n")
@@ -437,9 +432,9 @@ jobs:
           set -Eeuo pipefail
           docker info >/dev/null
           for worker in \
-            bitrix24-category-backfill-2025 \
-            bitrix24-category-backfill-2025-next \
-            bitrix24-category-backfill-2025-previous; do
+            bitrix24-category-backfill-2026 \
+            bitrix24-category-backfill-2026-next \
+            bitrix24-category-backfill-2026-previous; do
             existing="$(docker ps -a --filter "name=^/${worker}$" --format '{{.Names}}')"
             if [ -n "${existing}" ]; then
               if [ "${existing}" != "${worker}" ]; then
@@ -508,7 +503,7 @@ jobs:
             exit 0
           fi
           next_slice="$((CURRENT_SLICE + 1))"
-          gh workflow run -R "${GITHUB_REPOSITORY}" precision-backfill-2025.yml \
+          gh workflow run -R "${GITHUB_REPOSITORY}" precision-backfill-2026.yml \
             --ref main -f "slice=${next_slice}"
           echo "Processing slice ${next_slice} was dispatched"
 
