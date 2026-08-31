@@ -6,3 +6,4 @@ model_workers=1
 deterministic_only=false
 include_category_present=false
 one_shot=true
+retry=1
