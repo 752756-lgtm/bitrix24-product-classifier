@@ -8,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github/workflows/prepare-activity-plan-2026.yml"
 MARKER_RELATIVE = Path(
     ".github/workflow-triggers/"
-    "prepare-activity-plan-2026-bounded-500-skip-0-retry-1.trigger"
+    "prepare-activity-plan-2026-bounded-500-skip-0-retry-2.trigger"
 )
 MARKER_PATH = ROOT / MARKER_RELATIVE
-MARKER_SHA256 = "2d6fbfa16b9b291b7237861f35fd6b4e1502ef2e6a99420a1c43e3afbf582e72"
+MARKER_SHA256 = "69fc1ba8f804f59ae19a39069ef3caed285205a22966d400963dfd59c05c3f6f"
 
 
 class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
             b"deterministic_only=false\n"
             b"include_category_present=false\n"
             b"one_shot=true\n"
-            b"retry=1\n",
+            b"retry=2\n",
         )
         self.assertEqual(hashlib.sha256(MARKER_PATH.read_bytes()).hexdigest(), MARKER_SHA256)
         self.assertIn(f"ONE_SHOT_MARKER_SHA256: {MARKER_SHA256}", self.workflow)
@@ -172,6 +172,15 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
             )
         )
         self.assertEqual(parent_map["year"], 2026)
+
+
+    def test_publisher_marks_new_2026_assets_for_diff(self):
+        self.assertIn(
+            "git add --intent-to-add -- \\\n"
+            "            classifier/data/precision-2026.allowlist \\\n"
+            "            classifier/data/precision-2026-taxonomy.json",
+            self.workflow,
+        )
 
 
 if __name__ == "__main__":
