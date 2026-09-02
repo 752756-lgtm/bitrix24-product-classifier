@@ -8,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github/workflows/prepare-activity-plan-2026.yml"
 MARKER_RELATIVE = Path(
     ".github/workflow-triggers/"
-    "prepare-activity-plan-2026-bounded-30-skip-0-retry-3.trigger"
+    "prepare-activity-plan-2026-bounded-30-skip-0-retry-4.trigger"
 )
 MARKER_PATH = ROOT / MARKER_RELATIVE
-MARKER_SHA256 = "097450d07ad1bf71f5a0b3f7a9ffe8d6a6effe17a6c62b59642622acbce47935"
+MARKER_SHA256 = "aa3d3e33aca3874b71b9a56141fd1d513ca7479b41fa3e9d6db15ee6115b7dfa"
 
 
 class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
             b"deterministic_only=false\n"
             b"include_category_present=false\n"
             b"one_shot=true\n"
-            b"retry=3\n",
+            b"retry=4\n",
         )
         self.assertEqual(hashlib.sha256(MARKER_PATH.read_bytes()).hexdigest(), MARKER_SHA256)
         self.assertIn(f"ONE_SHOT_MARKER_SHA256: {MARKER_SHA256}", self.workflow)

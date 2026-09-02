@@ -52,6 +52,8 @@ DEFAULT_PARENT_MAP = Path(__file__).with_name("data") / "precision-2025-parent-m
 MAX_CLASSIFIER_ACTIVITY_CHARS = 16_000
 MAX_CLASSIFIER_TOTAL_CHARS = 96_000
 MAX_OPENAI_ATTEMPTS = 3
+MAX_CANARY_ATTEMPTS = 2
+CANARY_RETRY_DELAY_SECONDS = 2.0
 DIAGNOSTIC_FORMAT = "bitrix24-activity-preparation-diagnostic-v1"
 DIAGNOSTIC_STAGES = frozenset(
     {
@@ -2074,27 +2076,31 @@ class OpenAIActivityClassifier:
                 }
             },
         }
-        try:
-            value = json.loads(_output_text(self._request_response(payload)))
-        except CodedPreparationError:
-            raise
-        except (
-            AttributeError,
-            KeyError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ):
-            raise CodedPreparationError(
-                "OpenAI Structured Outputs canary response was invalid",
-                failure_code="model_response_invalid",
-            ) from None
-        if value != expected:
-            raise CodedPreparationError(
-                "OpenAI Structured Outputs canary response was invalid",
-                failure_code="model_response_invalid",
-            )
+        for attempt in range(1, MAX_CANARY_ATTEMPTS + 1):
+            try:
+                value = json.loads(_output_text(self._request_response(payload)))
+                if value != expected:
+                    raise ValueError
+                return
+            except CodedPreparationError as exc:
+                if exc.failure_code != "model_response_invalid":
+                    raise
+            except (
+                AttributeError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                pass
+            if attempt == MAX_CANARY_ATTEMPTS:
+                raise CodedPreparationError(
+                    "OpenAI Structured Outputs canary response was invalid",
+                    failure_code="model_response_invalid",
+                ) from None
+            self.sleeper(CANARY_RETRY_DELAY_SECONDS)
+        raise AssertionError("unreachable")
 
     def _one_pass(
         self,
