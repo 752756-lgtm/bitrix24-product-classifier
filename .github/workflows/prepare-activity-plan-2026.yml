@@ -39,7 +39,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-0-retry-2.trigger"
+      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-3.trigger"
 
 permissions:
   contents: read
@@ -66,11 +66,11 @@ jobs:
       OPENAI_MODEL: gpt-5.6-luna
       ACTIVITY_PREP_HTTP_TIMEOUT: "90"
       ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
-      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-0-retry-2.trigger
-      ONE_SHOT_MARKER_SHA256: 69fc1ba8f804f59ae19a39069ef3caed285205a22966d400963dfd59c05c3f6f
+      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-3.trigger
+      ONE_SHOT_MARKER_SHA256: 097450d07ad1bf71f5a0b3f7a9ffe8d6a6effe17a6c62b59642622acbce47935
       INVOCATION_MODE: ${{ github.event_name == 'push' && 'one_shot' || 'manual' }}
       EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.writer_run_id || '' }}
-      MAX_DEALS: ${{ github.event_name == 'push' && '500' || inputs.max_deals }}
+      MAX_DEALS: ${{ github.event_name == 'push' && '30' || inputs.max_deals }}
       SKIP_REMAINING: ${{ github.event_name == 'push' && '0' || inputs.skip_remaining }}
       MODEL_WORKERS: ${{ github.event_name == 'push' && '1' || inputs.model_workers }}
       DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'false' || inputs.deterministic_only }}
@@ -130,7 +130,7 @@ jobs:
               fi
               if [ -n "${EXPECTED_WRITER_RUN_ID}" ] || \
                  [ "${MAX_DEALS}:${SKIP_REMAINING}:${MODEL_WORKERS}:${DETERMINISTIC_ONLY}:${INCLUDE_CATEGORY_PRESENT}" != \
-                   "500:0:1:false:false" ]; then
+                   "30:0:1:false:false" ]; then
                 echo "::error::The one-shot push has unexpected effective inputs"
                 exit 1
               fi
