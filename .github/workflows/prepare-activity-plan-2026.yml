@@ -39,7 +39,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-4.trigger"
+      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-0-deterministic-retry-5.trigger"
 
 permissions:
   contents: read
@@ -66,14 +66,14 @@ jobs:
       OPENAI_MODEL: gpt-5.6-luna
       ACTIVITY_PREP_HTTP_TIMEOUT: "90"
       ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
-      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-4.trigger
-      ONE_SHOT_MARKER_SHA256: aa3d3e33aca3874b71b9a56141fd1d513ca7479b41fa3e9d6db15ee6115b7dfa
+      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-0-deterministic-retry-5.trigger
+      ONE_SHOT_MARKER_SHA256: 896f50df4426504a893c791fee4350f6e1d22911dbc3dc944fb29a8f110308e1
       INVOCATION_MODE: ${{ github.event_name == 'push' && 'one_shot' || 'manual' }}
       EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.writer_run_id || '' }}
-      MAX_DEALS: ${{ github.event_name == 'push' && '30' || inputs.max_deals }}
+      MAX_DEALS: ${{ github.event_name == 'push' && '500' || inputs.max_deals }}
       SKIP_REMAINING: ${{ github.event_name == 'push' && '0' || inputs.skip_remaining }}
       MODEL_WORKERS: ${{ github.event_name == 'push' && '1' || inputs.model_workers }}
-      DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'false' || inputs.deterministic_only }}
+      DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'true' || inputs.deterministic_only }}
       INCLUDE_CATEGORY_PRESENT: ${{ github.event_name == 'push' && 'false' || inputs.include_category_present }}
     steps:
       - name: Checkout main without persisted credentials
@@ -130,7 +130,7 @@ jobs:
               fi
               if [ -n "${EXPECTED_WRITER_RUN_ID}" ] || \
                  [ "${MAX_DEALS}:${SKIP_REMAINING}:${MODEL_WORKERS}:${DETERMINISTIC_ONLY}:${INCLUDE_CATEGORY_PRESENT}" != \
-                   "30:0:1:false:false" ]; then
+                   "500:0:1:true:false" ]; then
                 echo "::error::The one-shot push has unexpected effective inputs"
                 exit 1
               fi
@@ -281,7 +281,7 @@ jobs:
       - name: Validate inputs and required secrets
         env:
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ github.event_name == 'workflow_dispatch' && !inputs.deterministic_only && secrets.OPENAI_API_KEY || '' }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -345,7 +345,7 @@ jobs:
       - name: Fresh read-only activity preparation
         env:
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
-          OPENAI_API_KEY: ${{ (github.event_name == 'push' || !inputs.deterministic_only) && secrets.OPENAI_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ github.event_name == 'workflow_dispatch' && !inputs.deterministic_only && secrets.OPENAI_API_KEY || '' }}
         shell: bash
         run: |
           set -Eeuo pipefail
