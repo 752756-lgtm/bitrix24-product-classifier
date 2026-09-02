@@ -7,10 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github/workflows/prepare-activity-plan-2026.yml"
 MARKER_RELATIVE = Path(
     ".github/workflow-triggers/"
-    "prepare-activity-plan-2026-bounded-500-skip-497-deterministic-slice-2.trigger"
+    "prepare-activity-plan-2026-bounded-500-skip-497-deterministic-slice-2-retry-1.trigger"
 )
 MARKER_PATH = ROOT / MARKER_RELATIVE
-MARKER_SHA256 = "dd2aca906cdf97f466a75bfb51bcc2cdad80d25b9dc0df8a6ff3b17b918a961c"
+MARKER_SHA256 = "a873cfa2c76edc08d877e6c8f23dd26e4c96e6c68db7709b454374312ba98a9b"
 
 
 class PrepareActivityBoundedOneShotWorkflow2026Tests(unittest.TestCase):
@@ -45,7 +45,8 @@ class PrepareActivityBoundedOneShotWorkflow2026Tests(unittest.TestCase):
             b"deterministic_only=true\n"
             b"include_category_present=false\n"
             b"one_shot=true\n"
-            b"slice=2\n",
+            b"slice=2\n"
+            b"retry=1\n",
         )
         self.assertEqual(hashlib.sha256(MARKER_PATH.read_bytes()).hexdigest(), MARKER_SHA256)
         self.assertIn(f"ONE_SHOT_MARKER_SHA256: {MARKER_SHA256}", self.workflow)
@@ -144,6 +145,33 @@ class PrepareActivityBoundedOneShotWorkflow2026Tests(unittest.TestCase):
         self.assertNotIn("resolve_terminal_writer", self.workflow)
         self.assertNotIn("precision-backfill-2025.yml", self.workflow)
         self.assertNotIn("precision-2025.", self.workflow)
+
+    def test_scan_audit_has_one_bounded_retry_and_aggregate_only_diagnostics(self):
+        audit = self.workflow.split(
+            "      - name: Read-only full-year discovery audit\n", 1
+        )[1].split("\n      - name: Create public-assets-only draft pull request", 1)[0]
+        for expected in (
+            "for audit_attempt in 1 2; do",
+            'audit_state="${SCAN_STATE}.${audit_attempt}"',
+            'audit_status="${SCAN_STATUS}.${audit_attempt}"',
+            'PRECISION_STATE_PATH="${audit_state}"',
+            'PRECISION_STATUS_PATH="${audit_status}"',
+            'if [ "${audit_attempt}" -eq 1 ]; then',
+            "sleep 60",
+            'if [ "${audit_rc}" -ne 0 ]; then',
+            '"failure_stage": "full_year_discovery_audit"',
+            '"failure_code": "scan_worker_exit_nonzero"',
+            '"status_available": False',
+            '"plan_total": nonnegative_int(status.get("plan_total"))',
+            '"scan_complete": exact_bool(status.get("scan_complete"))',
+            '"permanent_error",',
+            'print("audit_summary=" + json.dumps(summary, sort_keys=True))',
+        ):
+            self.assertIn(expected, audit)
+        self.assertEqual(audit.count("python -m classifier.precision_worker --scan-only"), 1)
+        self.assertEqual(audit.count('python - "${audit_status}" <<\'PY\''), 2)
+        self.assertNotIn('status.get("last_error")', audit)
+        self.assertNotIn('print(Path("${SCAN_LOG}")', audit)
 
 
 if __name__ == "__main__":

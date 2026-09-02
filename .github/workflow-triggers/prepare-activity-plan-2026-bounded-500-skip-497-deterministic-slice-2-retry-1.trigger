@@ -8,3 +8,4 @@ deterministic_only=true
 include_category_present=false
 one_shot=true
 slice=2
+retry=1

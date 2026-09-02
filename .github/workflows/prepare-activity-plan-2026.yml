@@ -38,7 +38,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-497-deterministic-slice-2.trigger"
+      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-497-deterministic-slice-2-retry-1.trigger"
 
 permissions:
   contents: read
@@ -62,8 +62,8 @@ jobs:
       OPENAI_MODEL: gpt-5.6-luna
       ACTIVITY_PREP_HTTP_TIMEOUT: "90"
       ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
-      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-497-deterministic-slice-2.trigger
-      ONE_SHOT_MARKER_SHA256: dd2aca906cdf97f466a75bfb51bcc2cdad80d25b9dc0df8a6ff3b17b918a961c
+      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-500-skip-497-deterministic-slice-2-retry-1.trigger
+      ONE_SHOT_MARKER_SHA256: a873cfa2c76edc08d877e6c8f23dd26e4c96e6c68db7709b454374312ba98a9b
       INVOCATION_MODE: ${{ github.event_name == 'push' && 'one_shot' || 'manual' }}
       EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'push' && '33639638112' || inputs.writer_run_id }}
       EXPECTED_WRITER_HEAD_SHA: ${{ github.event_name == 'push' && 'e63fcec6f05cec90aef088656119d8a4b38b5f43' || '' }}
@@ -503,12 +503,91 @@ jobs:
         run: |
           set -Eeuo pipefail
           umask 077
-          if ! python -m classifier.precision_worker --scan-only \
-            > "${SCAN_LOG}" 2>&1; then
+          audit_rc=1
+          audit_status=""
+          for audit_attempt in 1 2; do
+            audit_state="${SCAN_STATE}.${audit_attempt}"
+            audit_status="${SCAN_STATUS}.${audit_attempt}"
+            audit_plan_key="${PRIVATE_DIR}/scan-${audit_attempt}.key"
+            audit_lock="${PRIVATE_DIR}/scan-${audit_attempt}.lock"
+            set +e
+            PRECISION_STATE_PATH="${audit_state}" \
+              PRECISION_STATUS_PATH="${audit_status}" \
+              PRECISION_PLAN_KEY_PATH="${audit_plan_key}" \
+              PRECISION_LOCK_PATH="${audit_lock}" \
+              python -m classifier.precision_worker --scan-only \
+              > "${SCAN_LOG}.${audit_attempt}" 2>&1
+            audit_rc=$?
+            set -e
+            if [ "${audit_rc}" -eq 0 ]; then
+              break
+            fi
+            if [ "${audit_attempt}" -eq 1 ]; then
+              echo "Read-only discovery audit attempt 1 failed; retrying once after 60 seconds"
+              sleep 60
+            fi
+          done
+          if [ "${audit_rc}" -ne 0 ]; then
+            python - "${audit_status}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          status_path = Path(sys.argv[1])
+          summary = {
+              "attempts": 2,
+              "failure_stage": "full_year_discovery_audit",
+              "failure_code": "scan_worker_exit_nonzero",
+              "status_available": False,
+          }
+          try:
+              status = json.loads(status_path.read_text(encoding="utf-8"))
+              queue = status.get("queue")
+              if not isinstance(queue, dict):
+                  raise ValueError
+
+              def nonnegative_int(value):
+                  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                      raise ValueError
+                  return value
+
+              def exact_bool(value):
+                  if not isinstance(value, bool):
+                      raise ValueError
+                  return value
+
+              summary = {
+                  "attempts": 2,
+                  "failure_stage": "full_year_discovery_audit",
+                  "failure_code": "scan_worker_exit_nonzero",
+                  "status_available": True,
+                  "plan_total": nonnegative_int(status.get("plan_total")),
+                  "discovered": nonnegative_int(status.get("discovered")),
+                  "undiscovered": nonnegative_int(status.get("undiscovered")),
+                  "scan_complete": exact_bool(status.get("scan_complete")),
+                  "scan_incomplete": exact_bool(status.get("scan_incomplete")),
+                  "queue": {
+                      name: nonnegative_int(queue.get(name, 0))
+                      for name in (
+                          "pending",
+                          "retry_wait",
+                          "inflight",
+                          "verified",
+                          "conflict",
+                          "excluded_stage",
+                          "missing",
+                          "permanent_error",
+                      )
+                  },
+              }
+          except (OSError, TypeError, ValueError, json.JSONDecodeError):
+              pass
+          print("audit_summary=" + json.dumps(summary, sort_keys=True))
+          PY
             echo "::error::Read-only discovery audit failed; private log remains runner-local"
             exit 1
           fi
-          python - "${SCAN_STATUS}" <<'PY'
+          python - "${audit_status}" <<'PY'
           import json
           import sys
           from pathlib import Path
