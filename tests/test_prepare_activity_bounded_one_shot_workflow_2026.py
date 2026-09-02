@@ -8,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github/workflows/prepare-activity-plan-2026.yml"
 MARKER_RELATIVE = Path(
     ".github/workflow-triggers/"
-    "prepare-activity-plan-2026-bounded-30-skip-0-retry-4.trigger"
+    "prepare-activity-plan-2026-bounded-500-skip-0-deterministic-retry-5.trigger"
 )
 MARKER_PATH = ROOT / MARKER_RELATIVE
-MARKER_SHA256 = "aa3d3e33aca3874b71b9a56141fd1d513ca7479b41fa3e9d6db15ee6115b7dfa"
+MARKER_SHA256 = "896f50df4426504a893c791fee4350f6e1d22911dbc3dc944fb29a8f110308e1"
 
 
 class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
@@ -40,13 +40,13 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
             MARKER_PATH.read_bytes(),
             b"prepare-activity-plan-2026\n"
             b"mode=auto-resolve-terminal-writer\n"
-            b"max_deals=30\n"
+            b"max_deals=500\n"
             b"skip_remaining=0\n"
             b"model_workers=1\n"
-            b"deterministic_only=false\n"
+            b"deterministic_only=true\n"
             b"include_category_present=false\n"
             b"one_shot=true\n"
-            b"retry=4\n",
+            b"retry=5\n",
         )
         self.assertEqual(hashlib.sha256(MARKER_PATH.read_bytes()).hexdigest(), MARKER_SHA256)
         self.assertIn(f"ONE_SHOT_MARKER_SHA256: {MARKER_SHA256}", self.workflow)
@@ -69,15 +69,22 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
 
         for expected in (
             "EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.writer_run_id || '' }}",
-            "MAX_DEALS: ${{ github.event_name == 'push' && '30' || inputs.max_deals }}",
+            "MAX_DEALS: ${{ github.event_name == 'push' && '500' || inputs.max_deals }}",
             "SKIP_REMAINING: ${{ github.event_name == 'push' && '0' || inputs.skip_remaining }}",
             "MODEL_WORKERS: ${{ github.event_name == 'push' && '1' || inputs.model_workers }}",
-            "DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'false' || inputs.deterministic_only }}",
+            "DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'true' || inputs.deterministic_only }}",
             "INCLUDE_CATEGORY_PRESENT: ${{ github.event_name == 'push' && 'false' || inputs.include_category_present }}",
-            '"30:0:1:false:false"',
+            '"500:0:1:true:false"',
             '--model-workers "${MODEL_WORKERS}"',
         ):
             self.assertIn(expected, self.workflow)
+        self.assertEqual(
+            self.workflow.count(
+                "OPENAI_API_KEY: ${{ github.event_name == 'workflow_dispatch' && "
+                "!inputs.deterministic_only && secrets.OPENAI_API_KEY || '' }}"
+            ),
+            2,
+        )
 
     def test_push_gate_rejects_replay_deletion_and_non_add_events(self):
         gate = self.workflow.split(
