@@ -1,0 +1,10 @@
+prepare-activity-plan-2026
+mode=fixed-terminal-writer
+writer_run_id=33657165406
+max_deals=500
+skip_remaining=996
+model_workers=1
+deterministic_only=true
+include_category_present=false
+one_shot=true
+slice=3
