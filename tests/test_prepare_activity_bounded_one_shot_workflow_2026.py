@@ -8,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ROOT / ".github/workflows/prepare-activity-plan-2026.yml"
 MARKER_RELATIVE = Path(
     ".github/workflow-triggers/"
-    "prepare-activity-plan-2026-bounded-500-skip-0-retry-2.trigger"
+    "prepare-activity-plan-2026-bounded-30-skip-0-retry-3.trigger"
 )
 MARKER_PATH = ROOT / MARKER_RELATIVE
-MARKER_SHA256 = "69fc1ba8f804f59ae19a39069ef3caed285205a22966d400963dfd59c05c3f6f"
+MARKER_SHA256 = "097450d07ad1bf71f5a0b3f7a9ffe8d6a6effe17a6c62b59642622acbce47935"
 
 
 class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
@@ -40,13 +40,13 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
             MARKER_PATH.read_bytes(),
             b"prepare-activity-plan-2026\n"
             b"mode=auto-resolve-terminal-writer\n"
-            b"max_deals=500\n"
+            b"max_deals=30\n"
             b"skip_remaining=0\n"
             b"model_workers=1\n"
             b"deterministic_only=false\n"
             b"include_category_present=false\n"
             b"one_shot=true\n"
-            b"retry=2\n",
+            b"retry=3\n",
         )
         self.assertEqual(hashlib.sha256(MARKER_PATH.read_bytes()).hexdigest(), MARKER_SHA256)
         self.assertIn(f"ONE_SHOT_MARKER_SHA256: {MARKER_SHA256}", self.workflow)
@@ -69,12 +69,12 @@ class PrepareActivityBoundedOneShotWorkflowTests(unittest.TestCase):
 
         for expected in (
             "EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.writer_run_id || '' }}",
-            "MAX_DEALS: ${{ github.event_name == 'push' && '500' || inputs.max_deals }}",
+            "MAX_DEALS: ${{ github.event_name == 'push' && '30' || inputs.max_deals }}",
             "SKIP_REMAINING: ${{ github.event_name == 'push' && '0' || inputs.skip_remaining }}",
             "MODEL_WORKERS: ${{ github.event_name == 'push' && '1' || inputs.model_workers }}",
             "DETERMINISTIC_ONLY: ${{ github.event_name == 'push' && 'false' || inputs.deterministic_only }}",
             "INCLUDE_CATEGORY_PRESENT: ${{ github.event_name == 'push' && 'false' || inputs.include_category_present }}",
-            '"500:0:1:false:false"',
+            '"30:0:1:false:false"',
             '--model-workers "${MODEL_WORKERS}"',
         ):
             self.assertIn(expected, self.workflow)
