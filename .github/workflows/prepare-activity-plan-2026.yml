@@ -39,7 +39,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-3.trigger"
+      - ".github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-4.trigger"
 
 permissions:
   contents: read
@@ -66,8 +66,8 @@ jobs:
       OPENAI_MODEL: gpt-5.6-luna
       ACTIVITY_PREP_HTTP_TIMEOUT: "90"
       ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
-      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-3.trigger
-      ONE_SHOT_MARKER_SHA256: 097450d07ad1bf71f5a0b3f7a9ffe8d6a6effe17a6c62b59642622acbce47935
+      ONE_SHOT_MARKER_PATH: .github/workflow-triggers/prepare-activity-plan-2026-bounded-30-skip-0-retry-4.trigger
+      ONE_SHOT_MARKER_SHA256: aa3d3e33aca3874b71b9a56141fd1d513ca7479b41fa3e9d6db15ee6115b7dfa
       INVOCATION_MODE: ${{ github.event_name == 'push' && 'one_shot' || 'manual' }}
       EXPECTED_WRITER_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.writer_run_id || '' }}
       MAX_DEALS: ${{ github.event_name == 'push' && '30' || inputs.max_deals }}

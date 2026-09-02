@@ -1143,6 +1143,59 @@ class ActivityPreparationTests(unittest.TestCase):
             malformed.canary()
         self.assertEqual(raised.exception.failure_code, "model_response_invalid")
 
+    def test_model_canary_retries_only_an_invalid_structured_response(self):
+        expected = OpenAIActivityClassifier._canary_value()
+        responses = iter([{"output": []}, openai_response(expected)])
+        calls = []
+        sleeps = []
+
+        def recovering_requester(*_args):
+            calls.append(1)
+            return next(responses)
+
+        recovering = OpenAIActivityClassifier(
+            "test-key",
+            "test-model",
+            requester=recovering_requester,
+            sleeper=sleeps.append,
+        )
+        recovering.canary()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [2.0])
+
+        invalid_calls = []
+        invalid_sleeps = []
+        invalid = OpenAIActivityClassifier(
+            "test-key",
+            "test-model",
+            requester=lambda *_args: invalid_calls.append(1) or {"output": []},
+            sleeper=invalid_sleeps.append,
+        )
+        with self.assertRaises(CodedPreparationError) as raised:
+            invalid.canary()
+        self.assertEqual(raised.exception.failure_code, "model_response_invalid")
+        self.assertEqual(len(invalid_calls), 2)
+        self.assertEqual(invalid_sleeps, [2.0])
+
+        rejected_calls = []
+        rejected_sleeps = []
+
+        def rejected_requester(*_args):
+            rejected_calls.append(1)
+            raise HTTPError("https://api.openai.test", 401, "unauthorized", {}, None)
+
+        rejected = OpenAIActivityClassifier(
+            "test-key",
+            "test-model",
+            requester=rejected_requester,
+            sleeper=rejected_sleeps.append,
+        )
+        with self.assertRaises(CodedPreparationError) as raised:
+            rejected.canary()
+        self.assertEqual(raised.exception.failure_code, "model_auth_rejected")
+        self.assertEqual(len(rejected_calls), 1)
+        self.assertEqual(rejected_sleeps, [])
+
     def test_hosted_preparation_requires_terminal_writer_and_shares_its_lock(self):
         workflow = (
             Path(__file__).resolve().parents[1]
