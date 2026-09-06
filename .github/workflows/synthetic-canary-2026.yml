@@ -1,1 +1,74 @@
-fatal: path '.github/workflows/synthetic-canary-2026.yml' exists on disk, but not in 'HEAD'
+name: Synthetic 2026 model response diagnostic
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/synthetic-canary-2026.yml]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: bitrix24-category-backfill-global-hosted
+  cancel-in-progress: false
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require new one-shot workflow and exact completed writer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python - <<'PY'
+          import json, os, subprocess, urllib.request
+          from pathlib import Path
+          def require(value):
+              if not value:
+                  raise SystemExit("Pilot safety gate rejected")
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          before = event.get('before', '')
+          require(len(before) == 40 and set(before) != {'0'})
+          require(not event.get('forced') and not event.get('deleted') and not event.get('created'))
+          workflow = '.github/workflows/synthetic-canary-2026.yml'
+          previous = subprocess.run(['git', 'cat-file', '-e', before + ':' + workflow], capture_output=True)
+          require(previous.returncode != 0)
+          change = subprocess.check_output(['git', 'diff', '--no-renames', '--name-status', before, os.environ['GITHUB_SHA'], '--', workflow], text=True).strip()
+          require(change == 'A\t' + workflow)
+          repo = '752756-lgtm/bitrix24-product-classifier'
+          require(os.environ['GITHUB_REPOSITORY'] == repo)
+          def get(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + '/' + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          head = '84d799d5e84d345b9cfeef8ee9e3f3ecc306de40'
+          writer = get('actions/runs/33979634087')
+          require(writer['status'] == 'completed' and writer['conclusion'] == 'success')
+          require(writer['head_sha'] == head and writer['head_branch'] == 'main')
+          require(writer['path'] == '.github/workflows/precision-backfill-2026.yml')
+          tag = get('git/ref/tags/precision-2026-complete-165031f3ff3bce00830175faabdc912c394c2fb0e80aa27e59bf87ffea548d8a')
+          require(tag['object']['type'] == 'commit' and tag['object']['sha'] == head)
+          require(subprocess.run(['git', 'merge-base', '--is-ancestor', head, os.environ['GITHUB_SHA']]).returncode == 0)
+          PY
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test before credentials are available
+        run: python -m unittest discover -s tests -q
+      - name: Bounded read-only model preparation and aggregate diagnostics
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-5.6-luna
+          ACTIVITY_PREP_HTTP_TIMEOUT: '90'
+          ACTIVITY_PREP_API_INTERVAL_SECONDS: '1.2'
+        run: python tools/synthetic_canary_2026.py
