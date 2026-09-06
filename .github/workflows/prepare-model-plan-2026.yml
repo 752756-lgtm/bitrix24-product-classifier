@@ -1,0 +1,663 @@
+name: Prepare funded 2026 model plan
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/prepare-model-plan-2026.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Share the writer's lock. A preparation dispatch waits for an active
+  # writer, while a later non-scheduled writer is allowed to cancel this
+  # read-only preparation before it can publish a stale plan.
+  group: bitrix24-category-backfill-global-hosted
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    env:
+      OPENAI_MODEL: gpt-5.6-luna
+      ACTIVITY_PREP_HTTP_TIMEOUT: "90"
+      ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
+      EXPECTED_WRITER_RUN_ID: "33979634087"
+      EXPECTED_WRITER_HEAD_SHA: ""
+      MAX_DEALS: "30"
+      SKIP_REMAINING: "0"
+      MODEL_WORKERS: "1"
+      DETERMINISTIC_ONLY: "false"
+      INCLUDE_CATEGORY_PRESENT: "false"
+    steps:
+      - name: Checkout main without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require new one-shot workflow and exact completed writer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python - <<'PY'
+          import json, os, subprocess, urllib.request
+          from pathlib import Path
+          def require(value):
+              if not value:
+                  raise SystemExit("Pilot safety gate rejected")
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          before = event.get('before', '')
+          require(len(before) == 40 and set(before) != {'0'})
+          require(not event.get('forced') and not event.get('deleted') and not event.get('created'))
+          workflow = '.github/workflows/prepare-model-plan-2026.yml'
+          previous = subprocess.run(['git', 'cat-file', '-e', before + ':' + workflow], capture_output=True)
+          require(previous.returncode != 0)
+          change = subprocess.check_output(['git', 'diff', '--no-renames', '--name-status', before, os.environ['GITHUB_SHA'], '--', workflow], text=True).strip()
+          require(change == 'A\t' + workflow)
+          repo = '752756-lgtm/bitrix24-product-classifier'
+          require(os.environ['GITHUB_REPOSITORY'] == repo)
+          def get(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + '/' + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          head = '84d799d5e84d345b9cfeef8ee9e3f3ecc306de40'
+          writer = get('actions/runs/33979634087')
+          require(writer['status'] == 'completed' and writer['conclusion'] == 'success')
+          require(writer['head_sha'] == head and writer['head_branch'] == 'main')
+          require(writer['path'] == '.github/workflows/precision-backfill-2026.yml')
+          tag = get('git/ref/tags/precision-2026-complete-165031f3ff3bce00830175faabdc912c394c2fb0e80aa27e59bf87ffea548d8a')
+          require(tag['object']['type'] == 'commit' and tag['object']['sha'] == head)
+          require(subprocess.run(['git', 'merge-base', '--is-ancestor', head, os.environ['GITHUB_SHA']]).returncode == 0)
+          PY
+
+      - name: Require main dispatch and terminal current writer plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Preparation workflow must be dispatched from main"
+            exit 1
+          fi
+          if [[ ! "${EXPECTED_WRITER_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::writer_run_id must be numeric"
+            exit 1
+          fi
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+          exact="${RUNNER_TEMP}/writer-run.json"
+          active="${RUNNER_TEMP}/writer-active.json"
+          umask 077
+          curl -fsSL "${auth[@]}" "${api}/actions/runs/${EXPECTED_WRITER_RUN_ID}" > "${exact}"
+          curl -fsSL "${auth[@]}" \
+            "${api}/actions/workflows/precision-backfill-2026.yml/runs?branch=main&status=in_progress&per_page=1" \
+            > "${active}"
+          fingerprint="$({
+            sha256sum classifier/precision_worker.py
+            sha256sum classifier/precision_plan.py
+            sha256sum classifier/bitrix.py
+            sha256sum classifier/http.py
+            sha256sum classifier/data/precision-2026.allowlist
+            sha256sum classifier/data/precision-2026-taxonomy.json
+          } | sha256sum | cut -d' ' -f1)"
+          completion_marker="precision-2026-complete-${fingerprint}"
+          if ! tag_rows="$(git ls-remote --exit-code --refs --tags \
+            origin "refs/tags/${completion_marker}")"; then
+            echo "::error::Current writer and signed plan have no terminal completion marker"
+            exit 1
+          fi
+          tag_row_count="$(printf '%s\n' "${tag_rows}" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+          if [ "${tag_row_count}" != "1" ]; then
+            echo "::error::Completion marker did not resolve to exactly one ref"
+            exit 1
+          fi
+          IFS=$'\t' read -r tag_target_sha tag_ref <<< "${tag_rows}"
+          if [[ ! "${tag_target_sha}" =~ ^[0-9a-f]{40}$ ]] || \
+             [ "${tag_ref}" != "refs/tags/${completion_marker}" ]; then
+            echo "::error::Completion marker ref is malformed"
+            exit 1
+          fi
+          python - "${exact}" "${active}" "${EXPECTED_WRITER_RUN_ID}" \
+            "${EXPECTED_WRITER_HEAD_SHA}" "${tag_target_sha}" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          exact = json.loads(Path(sys.argv[1]).read_text())
+          active = json.loads(Path(sys.argv[2]).read_text()).get("workflow_runs", [])
+          expected = int(sys.argv[3])
+          configured_head = sys.argv[4]
+          tag_target = sys.argv[5]
+          expected_head = configured_head or tag_target
+          if not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+              raise SystemExit("Expected writer head SHA is malformed")
+          if (
+              exact.get("id") != expected
+              or exact.get("status") != "completed"
+              or exact.get("conclusion") != "success"
+              or exact.get("head_branch") != "main"
+              or exact.get("head_sha") != expected_head
+              or exact.get("path") != ".github/workflows/precision-backfill-2026.yml"
+          ):
+              raise SystemExit("Writer run is not a completed successful main run")
+          if tag_target != expected_head:
+              raise SystemExit("Completion marker does not target the writer head")
+          if active:
+              raise SystemExit("A precision writer is still active")
+          PY
+          if ! git merge-base --is-ancestor "${tag_target_sha}" "${GITHUB_SHA}"; then
+            echo "::error::Completed writer plan is not an ancestor of this invocation"
+            exit 1
+          fi
+
+      - name: Validate inputs and required secrets
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "${MAX_DEALS}" =~ ^[0-9]+$ ]]; then
+            echo "::error::max_deals must be a non-negative integer"
+            exit 1
+          fi
+          if [[ ! "${SKIP_REMAINING}" =~ ^[0-9]+$ ]]; then
+            echo "::error::skip_remaining must be a non-negative integer"
+            exit 1
+          fi
+          if [[ ! "${MODEL_WORKERS}" =~ ^[1-5]$ ]]; then
+            echo "::error::model_workers must be an integer from 1 through 5"
+            exit 1
+          fi
+          missing=0
+          if [ -z "${BITRIX_WEBHOOK_URL}" ]; then
+            echo "::error::GitHub Secret BITRIX_WEBHOOK_URL is not configured"
+            missing=1
+          fi
+          if [ "${DETERMINISTIC_ONLY}" != "true" ] && [ -z "${OPENAI_API_KEY}" ]; then
+            echo "::error::GitHub Secret OPENAI_API_KEY is not configured"
+            missing=1
+          fi
+          exit "${missing}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install and test preparation code
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+          python -m compileall -q classifier tests tools
+
+      - name: Allocate private runner-only paths
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          private_dir="$(mktemp -d "${RUNNER_TEMP}/activity-plan.XXXXXX")"
+          {
+            echo "PRIVATE_DIR=${private_dir}"
+            echo "PRIVATE_PLAN=${private_dir}/plan.json"
+            echo "PRIVATE_PRODUCTS=${private_dir}/products.json"
+            echo "PRIVATE_CHECKPOINT=${private_dir}/checkpoint.json"
+            echo "PRIVATE_STATUS=${private_dir}/preparation-status.json"
+            echo "PRIVATE_DIAGNOSTICS=${private_dir}/preparation-diagnostics.json"
+            echo "PRIVATE_LOG=${private_dir}/preparation.log"
+            echo "PUBLIC_ALLOWLIST=${private_dir}/precision-2026.allowlist"
+            echo "PUBLIC_TAXONOMY=${private_dir}/precision-2026-taxonomy.json"
+            echo "SCAN_STATE=${private_dir}/scan.sqlite3"
+            echo "SCAN_STATUS=${private_dir}/scan-status.json"
+            echo "SCAN_LOG=${private_dir}/scan.log"
+          } >> "${GITHUB_ENV}"
+
+      - name: Fresh read-only activity preparation
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          args=(
+            --year 2026
+            --plan "${PRIVATE_PLAN}"
+            --products "${PRIVATE_PRODUCTS}"
+            --checkpoint "${PRIVATE_CHECKPOINT}"
+            --status "${PRIVATE_STATUS}"
+            --diagnostics "${PRIVATE_DIAGNOSTICS}"
+            --max-deals "${MAX_DEALS}"
+            --skip-remaining "${SKIP_REMAINING}"
+            --model-workers "${MODEL_WORKERS}"
+            --api-call-cap 12000
+            --parent-map classifier/data/precision-2026-parent-map.json
+          )
+          if [ "${DETERMINISTIC_ONLY}" = "true" ]; then
+            args+=(--deterministic-only)
+          fi
+          if [ "${INCLUDE_CATEGORY_PRESENT}" = "true" ]; then
+            args+=(--include-category-present)
+          fi
+          preparation_rc=0
+          python -m classifier.activity_prepare "${args[@]}" \
+            > "${PRIVATE_LOG}" 2>&1 || preparation_rc=$?
+          if [ "${preparation_rc}" -ne 0 ]; then
+            python - "${PRIVATE_DIAGNOSTICS}" "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json
+          import stat
+          import sys
+          from pathlib import Path
+
+          from classifier.activity_prepare import (
+              DIAGNOSTIC_FAILURE_CODES,
+              DIAGNOSTIC_FORMAT,
+              DIAGNOSTIC_STAGES,
+              PreparationStats,
+          )
+
+          stage = "diagnostic_unavailable"
+          code = "diagnostic_unavailable"
+          counters = {}
+          try:
+              path = Path(sys.argv[1])
+              mode = path.lstat().st_mode
+              if stat.S_ISLNK(mode) or not stat.S_ISREG(mode) or mode & 0o077:
+                  raise ValueError
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              expected_keys = {
+                  "format", "outcome", "failure_stage", "failure_code", "stats", "taxonomy"
+              }
+              if not isinstance(payload, dict) or set(payload) != expected_keys:
+                  raise ValueError
+              if payload["format"] != DIAGNOSTIC_FORMAT:
+                  raise ValueError
+              if payload["failure_stage"] not in DIAGNOSTIC_STAGES:
+                  raise ValueError
+              if payload["outcome"] == "failure":
+                  if (
+                      payload["failure_code"] not in DIAGNOSTIC_FAILURE_CODES
+                      or payload["failure_code"] == "none"
+                  ):
+                      raise ValueError
+                  code = payload["failure_code"]
+              elif payload["outcome"] == "running":
+                  if payload["failure_code"] != "none":
+                      raise ValueError
+                  code = "process_terminated"
+              else:
+                  raise ValueError
+              safe_counter_names = set(PreparationStats().__dict__)
+              stats_value = payload["stats"]
+              taxonomy_value = payload["taxonomy"]
+              if (
+                  not isinstance(stats_value, dict)
+                  or set(stats_value) != safe_counter_names
+                  or any(type(value) is not int or value < 0 for value in stats_value.values())
+                  or not isinstance(taxonomy_value, dict)
+                  or set(taxonomy_value) != {"categories", "subcategories", "pairs"}
+                  or any(type(value) is not int or value < 0 for value in taxonomy_value.values())
+              ):
+                  raise ValueError
+              stage = payload["failure_stage"]
+              counters = {
+                  "scanned": stats_value["scanned"],
+                  "remaining": stats_value["remaining"],
+                  "accepted": (
+                      stats_value["accepted_full_pair"]
+                      + stats_value["accepted_category_only"]
+                  ),
+                  "bitrix_api_calls": stats_value["bitrix_api_calls"],
+                  "bitrix_api_call_cap": stats_value["bitrix_api_call_cap"],
+              }
+          except (OSError, TypeError, ValueError, json.JSONDecodeError):
+              pass
+
+          summary_path = Path(sys.argv[2])
+          with summary_path.open("a", encoding="utf-8") as handle:
+              handle.write("## Activity-v5 preparation failure\n\n")
+              handle.write(f"- Failure stage: `{stage}`\n")
+              handle.write(f"- Failure code: `{code}`\n")
+              if counters:
+                  handle.write(f"- Deals scanned: {counters['scanned']}\n")
+                  handle.write(f"- Remaining target scope: {counters['remaining']}\n")
+                  handle.write(f"- Accepted before failure: {counters['accepted']}\n")
+                  handle.write(
+                      "- Bitrix API calls/cap: "
+                      f"{counters['bitrix_api_calls']}/"
+                      f"{counters['bitrix_api_call_cap']}\n"
+                  )
+              handle.write("- Raw activity evidence and API descriptions were not published\n")
+          print(
+              "::error::Activity preparation failed: "
+              f"stage={stage}; code={code}; private log remains runner-local"
+          )
+          PY
+            exit "${preparation_rc}"
+          fi
+
+      - name: Generate signed v5 assets in runner temp
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          PRECISION_PLAN_KEY: ${{ secrets.PRECISION_PLAN_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          generator_log="${PRIVATE_DIR}/generator.log"
+          if ! python -m tools.generate_precision_plan_assets \
+            --plan "${PRIVATE_PLAN}" \
+            --products "${PRIVATE_PRODUCTS}" \
+            --allowlist "${PUBLIC_ALLOWLIST}" \
+            --taxonomy "${PUBLIC_TAXONOMY}" \
+            --year 2026 > "${generator_log}" 2>&1; then
+            echo "::error::Signed asset generation failed; private log remains runner-local"
+            exit 1
+          fi
+          chmod 0600 "${PUBLIC_ALLOWLIST}" "${PUBLIC_TAXONOMY}"
+          for secret_value in "${BITRIX_WEBHOOK_URL}" "${PRECISION_PLAN_KEY}"; do
+            if [ -n "${secret_value}" ] && \
+              grep -Fq -- "${secret_value}" "${PUBLIC_ALLOWLIST}" "${PUBLIC_TAXONOMY}"; then
+              echo "::error::Secret sentinel found in generated public assets"
+              exit 1
+            fi
+          done
+
+      - name: Read-only full-year discovery audit
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          PRECISION_PLAN_KEY: ${{ secrets.PRECISION_PLAN_KEY }}
+          PRECISION_ALLOWLIST_PATH: ${{ env.PUBLIC_ALLOWLIST }}
+          PRECISION_TAXONOMY_PATH: ${{ env.PUBLIC_TAXONOMY }}
+          PRECISION_STATE_PATH: ${{ env.SCAN_STATE }}
+          PRECISION_STATUS_PATH: ${{ env.SCAN_STATUS }}
+          PRECISION_PLAN_KEY_PATH: ${{ env.PRIVATE_DIR }}/plan.key
+          PRECISION_LOCK_PATH: ${{ env.PRIVATE_DIR }}/scan.lock
+          PRECISION_YEAR: "2026"
+          PRECISION_API_INTERVAL_SECONDS: "1.2"
+          PRECISION_HTTP_TIMEOUT: "90"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          audit_rc=1
+          audit_status=""
+          for audit_attempt in 1 2; do
+            audit_state="${SCAN_STATE}.${audit_attempt}"
+            audit_status="${SCAN_STATUS}.${audit_attempt}"
+            audit_plan_key="${PRIVATE_DIR}/scan-${audit_attempt}.key"
+            audit_lock="${PRIVATE_DIR}/scan-${audit_attempt}.lock"
+            set +e
+            PRECISION_STATE_PATH="${audit_state}" \
+              PRECISION_STATUS_PATH="${audit_status}" \
+              PRECISION_PLAN_KEY_PATH="${audit_plan_key}" \
+              PRECISION_LOCK_PATH="${audit_lock}" \
+              python -m classifier.precision_worker --scan-only \
+              > "${SCAN_LOG}.${audit_attempt}" 2>&1
+            audit_rc=$?
+            set -e
+            if [ "${audit_rc}" -eq 0 ]; then
+              break
+            fi
+            if [ "${audit_attempt}" -eq 1 ]; then
+              echo "Read-only discovery audit attempt 1 failed; retrying once after 60 seconds"
+              sleep 60
+            fi
+          done
+          if [ "${audit_rc}" -ne 0 ]; then
+            python - "${audit_status}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          status_path = Path(sys.argv[1])
+          summary = {
+              "attempts": 2,
+              "failure_stage": "full_year_discovery_audit",
+              "failure_code": "scan_worker_exit_nonzero",
+              "status_available": False,
+          }
+          try:
+              status = json.loads(status_path.read_text(encoding="utf-8"))
+              queue = status.get("queue")
+              if not isinstance(queue, dict):
+                  raise ValueError
+
+              def nonnegative_int(value):
+                  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                      raise ValueError
+                  return value
+
+              def exact_bool(value):
+                  if not isinstance(value, bool):
+                      raise ValueError
+                  return value
+
+              summary = {
+                  "attempts": 2,
+                  "failure_stage": "full_year_discovery_audit",
+                  "failure_code": "scan_worker_exit_nonzero",
+                  "status_available": True,
+                  "plan_total": nonnegative_int(status.get("plan_total")),
+                  "discovered": nonnegative_int(status.get("discovered")),
+                  "undiscovered": nonnegative_int(status.get("undiscovered")),
+                  "scan_complete": exact_bool(status.get("scan_complete")),
+                  "scan_incomplete": exact_bool(status.get("scan_incomplete")),
+                  "queue": {
+                      name: nonnegative_int(queue.get(name, 0))
+                      for name in (
+                          "pending",
+                          "retry_wait",
+                          "inflight",
+                          "verified",
+                          "conflict",
+                          "excluded_stage",
+                          "missing",
+                          "permanent_error",
+                      )
+                  },
+              }
+          except (OSError, TypeError, ValueError, json.JSONDecodeError):
+              pass
+          print("audit_summary=" + json.dumps(summary, sort_keys=True))
+          PY
+            echo "::error::Read-only discovery audit failed; private log remains runner-local"
+            exit 1
+          fi
+          python - "${audit_status}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          status = json.loads(Path(sys.argv[1]).read_text())
+          queue = status.get("queue") or {}
+          total = int(status.get("plan_total", -1))
+          safe = int(queue.get("pending", 0)) + int(queue.get("verified", 0))
+          if (
+              total <= 0
+              or status.get("discovered") != total
+              or status.get("undiscovered") != 0
+              or status.get("scan_complete") is not True
+              or status.get("scan_incomplete") is not False
+              or safe != total
+              or sum(int(value) for value in queue.values()) != total
+          ):
+              raise SystemExit("Read-only discovery audit is not terminal-safe")
+          PY
+
+      - name: Create public-assets-only draft pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          git fetch --quiet origin main
+          if [ "$(git rev-parse origin/main)" != "${GITHUB_SHA}" ]; then
+            echo "::error::main advanced during preparation; refusing a stale plan PR"
+            exit 1
+          fi
+          branch="activity-plan-v5-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git switch --create "${branch}" origin/main
+          cp "${PUBLIC_ALLOWLIST}" classifier/data/precision-2026.allowlist
+          cp "${PUBLIC_TAXONOMY}" classifier/data/precision-2026-taxonomy.json
+          chmod 0644 \
+            classifier/data/precision-2026.allowlist \
+            classifier/data/precision-2026-taxonomy.json
+          git add --intent-to-add -- \
+            classifier/data/precision-2026.allowlist \
+            classifier/data/precision-2026-taxonomy.json
+          changed="$(git diff --name-only)"
+          if [ -z "${changed}" ]; then
+            echo "::error::Generated plan does not change public assets"
+            exit 1
+          fi
+          while IFS= read -r changed_path; do
+            case "${changed_path}" in
+              classifier/data/precision-2026.allowlist|classifier/data/precision-2026-taxonomy.json)
+                ;;
+              *)
+                echo "::error::Unexpected file changed during public plan preparation"
+                exit 1
+                ;;
+            esac
+          done <<< "${changed}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            classifier/data/precision-2026.allowlist \
+            classifier/data/precision-2026-taxonomy.json
+          git commit -m "Prepare reviewed activity evidence plan for 2026"
+          git fetch --quiet origin main
+          if [ "$(git rev-parse origin/main)" != "${GITHUB_SHA}" ]; then
+            echo "::error::main advanced before plan publication; refusing stale assets"
+            exit 1
+          fi
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)" \
+            push origin "HEAD:refs/heads/${branch}"
+          body="${PRIVATE_DIR}/pr-body.md"
+          python - "${PRIVATE_STATUS}" "${body}" "${GITHUB_RUN_ID}" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          status = json.loads(Path(sys.argv[1]).read_text())
+          stats = status["stats"]
+          scope = status["scope"]
+          accepted = stats["accepted_full_pair"] + stats["accepted_category_only"]
+          scope_text = (
+              f"bounded partial scope: {scope['max_deals']} remaining deals "
+              f"after skipping {scope['skip_remaining']} earlier eligible deals"
+              if scope["partial"]
+              else (
+                  "complete fresh-year incomplete-classification scope "
+                  "including category-present/subcategory-blank deals"
+                  if scope["include_category_present"]
+                  else "complete fresh-year blank-category scope"
+              )
+          )
+          text = f"""Draft plan generated by the manual read-only activity preparation workflow.
+
+          Aggregate audit only:
+          - scope: {scope_text}
+          - accepted: {accepted}
+          - full pair: {stats['accepted_full_pair']}
+          - category only: {stats['accepted_category_only']}
+          - remaining scope scanned: {stats['remaining']}
+          - earlier eligible deals skipped: {stats['skipped_remaining']}
+          - Bitrix API calls/cap: {stats['bitrix_api_calls']}/{stats['bitrix_api_call_cap']}
+          - peak projected calls before final guards: {stats['projected_api_calls']}
+          - excluded stages honored across all funnels
+          - target IDs and labels matched fresh live CRM enums
+          - raw email bodies/transcripts stayed in RUNNER_TEMP mode 0600 and were not uploaded
+
+          This PR is intentionally draft. It must be reviewed and must not be merged while any category writer is active. The workflow does not merge this PR and does not start the writer.
+
+          Preparation run: {sys.argv[3]}
+          """
+          path = Path(sys.argv[2])
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w") as handle:
+              handle.write(text)
+          PY
+          pr_title="Prepare activity evidence classifications for 2026"
+          if python - "${PRIVATE_STATUS}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          raise SystemExit(0 if json.loads(Path(sys.argv[1]).read_text())["scope"]["partial"] else 1)
+          PY
+          then
+            pr_title="Prepare bounded activity evidence slice for 2026"
+          fi
+          git fetch --quiet origin main
+          if [ "$(git rev-parse origin/main)" != "${GITHUB_SHA}" ]; then
+            echo "::error::main advanced before draft PR creation; refusing stale assets"
+            exit 1
+          fi
+          gh pr create \
+            --draft \
+            --base main \
+            --head "${branch}" \
+            --title "${pr_title}" \
+            --body-file "${body}"
+
+      - name: Publish aggregate job summary
+        if: success()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - "${PRIVATE_STATUS}" >> "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          status = json.loads(Path(sys.argv[1]).read_text())
+          stats = status["stats"]
+          scope = status["scope"]
+          accepted = stats["accepted_full_pair"] + stats["accepted_category_only"]
+          print("## Activity-v5 preparation")
+          print()
+          print(f"- Accepted: {accepted}")
+          print(f"- Full pair: {stats['accepted_full_pair']}")
+          print(f"- Category only: {stats['accepted_category_only']}")
+          print(f"- Remaining scope: {stats['remaining']}")
+          print(f"- Earlier eligible deals skipped: {stats['skipped_remaining']}")
+          print(
+              f"- Bitrix API calls/cap: {stats['bitrix_api_calls']}/"
+              f"{stats['bitrix_api_call_cap']}"
+          )
+          print(f"- Peak projected calls: {stats['projected_api_calls']}")
+          print(
+              f"- Scope: bounded partial {scope['max_deals']} remaining deals "
+              f"after skipping {scope['skip_remaining']} earlier eligible deals"
+              if scope["partial"]
+              else (
+                  "- Scope: complete fresh-year incomplete-classification scan "
+                  "including category-present/subcategory-blank deals"
+                  if scope["include_category_present"]
+                  else "- Scope: complete fresh-year blank-category scan"
+              )
+          )
+          print("- Raw activity evidence: runner-local only; no artifact uploaded")
+          print("- Result: draft PR only; no merge and no writer dispatch")
+          PY
