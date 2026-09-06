@@ -30,7 +30,7 @@ class ModelPilotTests(unittest.TestCase):
 
     def test_workflow_is_read_only_and_bounded(self):
         root = Path(__file__).resolve().parents[1]
-        w = (root / '.github/workflows/synthetic-canary-2026.yml').read_text()
+        w = (root / '.github/workflows/synthetic-canary-fixed-2026.yml').read_text()
         self.assertNotIn('BITRIX_WEBHOOK_URL', w)
         self.assertFalse((root / '.github/workflows/model-pilot-2026.yml').exists())
         s = (root / 'tools/model_pilot_2026.py').read_text()

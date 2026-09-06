@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from classifier.activity_prepare import OpenAIActivityClassifier, CodedPreparationError
+from classifier.activity_prepare import OpenAIActivityClassifier, CodedPreparationError, TransientPreparationError
 from classifier.ai import _output_text
 from classifier.http import post_json
 
@@ -36,6 +36,6 @@ if __name__ == '__main__':
     try:
         OpenAIActivityClassifier(os.environ['OPENAI_API_KEY'], 'gpt-5.6-luna', requester=inspect_response).canary()
         print('SYNTHETIC_CANARY_OK')
-    except CodedPreparationError as exc:
+    except (CodedPreparationError, TransientPreparationError) as exc:
         print(json.dumps({'failure_code': exc.failure_code}))
         raise SystemExit(1)
