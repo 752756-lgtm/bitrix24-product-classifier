@@ -2082,6 +2082,10 @@ class OpenAIActivityClassifier:
                 if value != expected:
                     raise ValueError
                 return
+            except TransientPreparationError:
+                # Transport retries have already been exhausted. Do not mask
+                # their diagnostic code or multiply retries as malformed JSON.
+                raise
             except CodedPreparationError as exc:
                 if exc.failure_code != "model_response_invalid":
                     raise

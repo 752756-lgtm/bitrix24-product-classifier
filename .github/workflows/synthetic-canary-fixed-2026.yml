@@ -2,7 +2,7 @@ name: Synthetic 2026 model response diagnostic
 on:
   push:
     branches: [main]
-    paths: [.github/workflows/synthetic-canary-2026.yml]
+    paths: [.github/workflows/synthetic-canary-fixed-2026.yml]
 permissions:
   contents: read
   actions: read
@@ -39,7 +39,7 @@ jobs:
           before = event.get('before', '')
           require(len(before) == 40 and set(before) != {'0'})
           require(not event.get('forced') and not event.get('deleted') and not event.get('created'))
-          workflow = '.github/workflows/synthetic-canary-2026.yml'
+          workflow = '.github/workflows/synthetic-canary-fixed-2026.yml'
           previous = subprocess.run(['git', 'cat-file', '-e', before + ':' + workflow], capture_output=True)
           require(previous.returncode != 0)
           change = subprocess.check_output(['git', 'diff', '--no-renames', '--name-status', before, os.environ['GITHUB_SHA'], '--', workflow], text=True).strip()

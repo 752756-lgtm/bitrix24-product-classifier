@@ -1103,6 +1103,16 @@ class ActivityPreparationTests(unittest.TestCase):
             missing_output.classify([block], taxonomy())
         self.assertEqual(raised.exception.failure_code, "model_response_invalid")
 
+    def test_canary_preserves_exhausted_transient_error_without_outer_retry(self):
+        for code in ("model_rate_limited", "model_timeout", "model_server_error"):
+            classifier = OpenAIActivityClassifier("test-key", "test-model")
+            failure = TransientPreparationError("safe", service="model", failure_code=code)
+            with patch.object(classifier, "_request_response", side_effect=failure) as request:
+                with self.assertRaises(TransientPreparationError) as raised:
+                    classifier.canary()
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(request.call_count, 1)
+
     def test_model_canary_is_synthetic_and_validates_structured_output(self):
         calls = []
 
