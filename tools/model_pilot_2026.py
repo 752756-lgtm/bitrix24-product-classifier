@@ -15,15 +15,18 @@ from classifier.activity_prepare import (
 )
 
 
-def public_summary(payload):
+def public_summary(payload, *, allow_running=False):
     if not isinstance(payload, dict) or payload.get("format") != DIAGNOSTIC_FORMAT:
         raise ValueError("Invalid diagnostic")
     stage, code = payload.get("failure_stage"), payload.get("failure_code")
     outcome = payload.get("outcome")
     if stage not in DIAGNOSTIC_STAGES or code not in DIAGNOSTIC_FAILURE_CODES:
         raise ValueError("Invalid diagnostic enum")
-    if outcome not in ("success", "failure"):
+    allowed_outcomes = ("success", "failure", "running") if allow_running else ("success", "failure")
+    if outcome not in allowed_outcomes:
         raise ValueError("Invalid outcome")
+    if (outcome == "failure") == (code == "none"):
+        raise ValueError("Invalid outcome code")
     stats = payload.get("stats")
     if not isinstance(stats, dict):
         raise ValueError("Invalid counters")
