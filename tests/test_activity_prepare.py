@@ -499,6 +499,125 @@ class ActivityPreparationTests(unittest.TestCase):
                 max_deals=1,
             )
 
+    def test_unbounded_scan_reads_all_pages_and_validates_skip_overshoot(self):
+        rows = [
+            {"ID": str(deal_id), "STAGE_ID": "NEW"}
+            for deal_id in range(1, 151)
+        ]
+        stats = PreparationStats()
+        bitrix = ScanBitrix(rows)
+        deals = scan_remaining_deals(
+            bitrix, year=2026, excluded_stage_ids=set(), stats=stats,
+        )
+        self.assertEqual([deal.deal_id for deal in deals], list(range(1, 151)))
+        self.assertEqual(stats.scanned, 150)
+        self.assertEqual(stats.scope_complete, 1)
+        self.assertEqual(len(bitrix.calls), 4)
+
+        skipped = ScanBitrix(rows)
+        with self.assertRaisesRegex(PreparationError, "skip_remaining"):
+            scan_remaining_deals(
+                skipped, year=2026, excluded_stage_ids=set(),
+                stats=PreparationStats(), max_deals=10, skip_remaining=151,
+            )
+        self.assertEqual(len(skipped.calls), 4)
+
+    def test_bounded_scan_stops_after_page_proving_partial_scope(self):
+        rows = [
+            {"ID": str(deal_id), "STAGE_ID": "NEW"}
+            for deal_id in range(1, 151)
+        ]
+        # The Nth row alone cannot establish that a bounded scope is partial.
+        # One more eligible row is on the next page, whose full page is counted.
+        stats = PreparationStats()
+        bitrix = ScanBitrix(rows)
+        deals = scan_remaining_deals(
+            bitrix, year=2026, excluded_stage_ids=set(), stats=stats,
+            max_deals=50,
+        )
+        self.assertEqual([deal.deal_id for deal in deals], list(range(1, 51)))
+        self.assertEqual(stats.scanned, 100)
+        self.assertEqual(stats.remaining, 50)
+        self.assertEqual(stats.scope_complete, 0)
+        self.assertEqual(len(bitrix.calls), 2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = Path(directory) / "status.json"
+            with patch.dict(os.environ, {"RUNNER_TEMP": directory}):
+                _write_status(
+                    status_path, stats, taxonomy=taxonomy(), scope_limit=50,
+                    skip_remaining=0, include_category_present=False,
+                )
+                scope = read_private_json(status_path)["scope"]
+            self.assertTrue(scope["partial"])
+            self.assertFalse(scope["complete"])
+
+    def test_exact_limit_reads_ineligible_tail_to_prove_complete_scope(self):
+        rows = [
+            {"ID": str(deal_id), "STAGE_ID": "NEW"}
+            for deal_id in range(1, 51)
+        ]
+        tail = [
+            {"ID": str(deal_id), "STAGE_ID": "DUP"}
+            for deal_id in range(51, 81)
+        ]
+        for source, excluded in ((rows, 0), (rows + tail, 30)):
+            with self.subTest(excluded=excluded):
+                stats = PreparationStats()
+                bitrix = ScanBitrix(source)
+                deals = scan_remaining_deals(
+                    bitrix, year=2026, excluded_stage_ids={"DUP"}, stats=stats,
+                    max_deals=50,
+                )
+                self.assertEqual(len(deals), 50)
+                self.assertEqual(stats.scanned, len(source))
+                self.assertEqual(stats.excluded_stage, excluded)
+                self.assertEqual(stats.scope_complete, 1)
+                self.assertEqual(len(bitrix.calls), 2)
+
+    def test_bounded_scan_skips_only_eligible_rows_with_category_present_option(self):
+        rows = [
+            {
+                "ID": str(deal_id), "STAGE_ID": "NEW",
+                CATEGORY_FIELD: "1821" if deal_id % 2 == 0 else "",
+            }
+            for deal_id in range(1, 151)
+        ]
+        for include_present, expected, scanned, present in (
+            (False, list(range(11, 71, 2)), 100, 50),
+            (True, list(range(6, 36)), 50, 0),
+        ):
+            with self.subTest(include_present=include_present):
+                stats = PreparationStats()
+                bitrix = ScanBitrix(rows)
+                deals = scan_remaining_deals(
+                    bitrix, year=2026, excluded_stage_ids=set(), stats=stats,
+                    max_deals=30, skip_remaining=5,
+                    include_category_present=include_present,
+                )
+                self.assertEqual([deal.deal_id for deal in deals], expected)
+                self.assertEqual(stats.scanned, scanned)
+                self.assertEqual(stats.category_present, present)
+                self.assertEqual(stats.skipped_remaining, 5)
+                self.assertEqual(stats.remaining, 30)
+                self.assertEqual(stats.scope_complete, 0)
+                self.assertEqual(len(bitrix.calls), scanned // 50)
+
+    def test_bounded_scan_validates_fetched_page_after_extra_eligible_row(self):
+        for final_id in ("2", "bad"):
+            with self.subTest(final_id=final_id):
+                class InvalidPage:
+                    def call(self, _method, _params):
+                        return [
+                            {"ID": "1"}, {"ID": "2"}, {"ID": final_id},
+                        ]
+
+                with self.assertRaisesRegex(PreparationError, "keyset"):
+                    scan_remaining_deals(
+                        InvalidPage(), year=2026, excluded_stage_ids=set(),
+                        stats=PreparationStats(), max_deals=1,
+                    )
+
     def test_classifier_text_removes_html_quotes_and_direct_pii(self):
         value = (
             "<p>Нужен тельфер. test@example.ru, +7 (999) 123-45-67</p>\n"
