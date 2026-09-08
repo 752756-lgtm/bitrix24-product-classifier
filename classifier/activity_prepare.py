@@ -295,6 +295,8 @@ def bounded_model_classifications(
 
 @dataclass
 class PreparationStats:
+    # Bounded preparation may inspect only a prefix. These discovery counters
+    # describe the rows actually inspected, not totals for the entire year.
     scanned: int = 0
     excluded_stage: int = 0
     complete_fields: int = 0
@@ -695,11 +697,18 @@ def scan_remaining_deals(
     skip_remaining: int = 0,
     include_category_present: bool = False,
 ) -> list[DealSnapshot]:
+    """Read an eligible prefix; prove partial scope with one extra eligible row.
+
+    Every fetched page is validated in full before an early return. Exact-limit
+    and unbounded scopes still read to EOF unless a further eligible row proves
+    that the requested scope omitted part of the year.
+    """
     if skip_remaining < 0:
         raise PreparationError("skip_remaining не может быть отрицательным")
     last_id = 0
     result: list[DealSnapshot] = []
     omitted_by_limit = bool(skip_remaining)
+    bounded_tail_seen = False
     while True:
         rows = bitrix.call(
             "crm.deal.list",
@@ -746,6 +755,7 @@ def scan_remaining_deals(
                 continue
             if max_deals and len(result) >= max_deals:
                 omitted_by_limit = True
+                bounded_tail_seen = True
             else:
                 result.append(
                     DealSnapshot(
@@ -757,6 +767,13 @@ def scan_remaining_deals(
                     )
                 )
                 stats.remaining += 1
+        if bounded_tail_seen:
+            # Skip has already been satisfied, and an additional eligible row
+            # proves partial scope. Avoid reading the rest of the year merely
+            # to count excluded/completed rows. The separate signed-plan
+            # discovery audit and writer still perform their full-year scans.
+            stats.scope_complete = 0
+            return result
         if len(rows) < 50:
             if stats.skipped_remaining != skip_remaining:
                 raise PreparationError(
