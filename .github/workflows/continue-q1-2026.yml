@@ -1,0 +1,28 @@
+name: Continue Q1 2026 category preparation
+
+on:
+  workflow_run:
+    workflows: ["Backfill Bitrix24 categories for 2026"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  continue:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch the next Q1 slice while active
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          marker='classifier/data/q1-2026-backfill-active'
+          if ! gh api "repos/${GITHUB_REPOSITORY}/contents/${marker}?ref=main" >/dev/null 2>&1; then
+            echo "Q1 chain is complete"
+            exit 0
+          fi
+          gh workflow run prepare-q1-2026-once.yml --repo "${GITHUB_REPOSITORY}" --ref main
