@@ -45,7 +45,6 @@ jobs:
           test "${GITHUB_REF}" = "refs/heads/main"
           test -n "${BITRIX_WEBHOOK_URL}"
           test -n "${OPENAI_API_KEY}"
-          test -n "${PRECISION_PLAN_KEY}"
           run_json="$(mktemp)"
           gh api repos/${GITHUB_REPOSITORY}/actions/runs/34222031645 > "${run_json}"
           python - "${run_json}" <<'PY'
