@@ -1,0 +1,33 @@
+name: Apply verified Q1 2026 plan
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: >-
+      github.event.pull_request.base.ref == 'main' &&
+      startsWith(github.event.pull_request.head.ref, 'q1-activity-plan-') &&
+      github.event.pull_request.title == 'Prepare Q1 2026 category assignments'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify exact plan-only change and merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' | sort)"
+          expected=$(printf '%s\n%s'             'classifier/data/precision-2026.allowlist'             'classifier/data/precision-2026-taxonomy.json')
+          if [ "${files}" != "${expected}" ]; then
+            echo "::error::Q1 plan PR changed unexpected files"
+            exit 1
+          fi
+          gh pr ready "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}"
+          gh pr merge "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --squash
