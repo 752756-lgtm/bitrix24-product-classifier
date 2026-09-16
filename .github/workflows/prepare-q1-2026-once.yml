@@ -1,0 +1,193 @@
+name: Prepare Q1 2026 activity plan once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/prepare-q1-2026-once.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bitrix24-category-backfill-global-hosted
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    env:
+      OPENAI_MODEL: gpt-5.6-luna
+      ACTIVITY_PREP_HTTP_TIMEOUT: "90"
+      ACTIVITY_PREP_API_INTERVAL_SECONDS: "1.2"
+      BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PRECISION_PLAN_KEY: ${{ secrets.PRECISION_PLAN_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the terminal 2026 writer and secrets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "${GITHUB_EVENT_NAME}" = "push"
+          test "${GITHUB_REF}" = "refs/heads/main"
+          test -n "${BITRIX_WEBHOOK_URL}"
+          test -n "${OPENAI_API_KEY}"
+          test -n "${PRECISION_PLAN_KEY}"
+          run_json="$(mktemp)"
+          gh api repos/${GITHUB_REPOSITORY}/actions/runs/34222031645 > "${run_json}"
+          python - "${run_json}" <<'PY'
+          import json, sys
+          run = json.load(open(sys.argv[1]))
+          expected = {
+              "id": 34222031645,
+              "status": "completed",
+              "conclusion": "success",
+              "head_branch": "main",
+              "head_sha": "e4e3746b5c1a5fd1df14c7413b362fdfe3af1d65",
+              "path": ".github/workflows/precision-backfill-2026.yml",
+          }
+          if any(run.get(key) != value for key, value in expected.items()):
+              raise SystemExit("terminal writer verification failed")
+          PY
+          git merge-base --is-ancestor e4e3746b5c1a5fd1df14c7413b362fdfe3af1d65 HEAD
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install and test
+        run: |
+          set -Eeuo pipefail
+          pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+          python -m compileall -q classifier tests tools
+
+      - name: Allocate private paths
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          private_dir="$(mktemp -d "${RUNNER_TEMP}/q1-plan.XXXXXX")"
+          {
+            echo "PRIVATE_DIR=${private_dir}"
+            echo "PRIVATE_PLAN=${private_dir}/plan.json"
+            echo "PRIVATE_PRODUCTS=${private_dir}/products.json"
+            echo "PRIVATE_CHECKPOINT=${private_dir}/checkpoint.json"
+            echo "PRIVATE_STATUS=${private_dir}/status.json"
+            echo "PRIVATE_DIAGNOSTICS=${private_dir}/diagnostics.json"
+            echo "PUBLIC_ALLOWLIST=${private_dir}/precision-2026.allowlist"
+            echo "PUBLIC_TAXONOMY=${private_dir}/precision-2026-taxonomy.json"
+            echo "SCAN_STATE=${private_dir}/scan.sqlite3"
+            echo "SCAN_STATUS=${private_dir}/scan-status.json"
+          } >> "${GITHUB_ENV}"
+
+      - name: Prepare January through March without CRM writes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          python - <<'PY'
+          import copy
+          import sys
+          from classifier import activity_prepare as module
+
+          original_call = module.ReliableBitrix.call
+
+          def q1_call(self, method, params):
+              if method == "crm.deal.list" and isinstance(params, dict):
+                  filters = params.get("filter")
+                  if isinstance(filters, dict) and ">=DATE_CREATE" in filters and "<DATE_CREATE" in filters:
+                      params = copy.deepcopy(params)
+                      params["filter"][">=DATE_CREATE"] = "2026-01-01T00:00:00+03:00"
+                      params["filter"]["<DATE_CREATE"] = "2026-04-01T00:00:00+03:00"
+              return original_call(self, method, params)
+
+          module.ReliableBitrix.call = q1_call
+          sys.argv = [
+              "activity_prepare",
+              "--year", "2026",
+              "--plan", __import__("os").environ["PRIVATE_PLAN"],
+              "--products", __import__("os").environ["PRIVATE_PRODUCTS"],
+              "--checkpoint", __import__("os").environ["PRIVATE_CHECKPOINT"],
+              "--status", __import__("os").environ["PRIVATE_STATUS"],
+              "--diagnostics", __import__("os").environ["PRIVATE_DIAGNOSTICS"],
+              "--max-deals", "200",
+              "--skip-remaining", "0",
+              "--model-workers", "1",
+              "--api-call-cap", "12000",
+              "--parent-map", "classifier/data/precision-2026-parent-map.json",
+              "--include-category-present",
+          ]
+          module.main()
+          PY
+
+      - name: Generate signed writer assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m tools.generate_precision_plan_assets             --plan "${PRIVATE_PLAN}"             --products "${PRIVATE_PRODUCTS}"             --allowlist "${PUBLIC_ALLOWLIST}"             --taxonomy "${PUBLIC_TAXONOMY}"             --year 2026
+
+      - name: Verify every planned row is discoverable
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export PRECISION_ALLOWLIST_PATH="${PUBLIC_ALLOWLIST}"
+          export PRECISION_TAXONOMY_PATH="${PUBLIC_TAXONOMY}"
+          export PRECISION_STATE_PATH="${SCAN_STATE}"
+          export PRECISION_STATUS_PATH="${SCAN_STATUS}"
+          export PRECISION_PLAN_KEY_PATH="${PRIVATE_DIR}/plan.key"
+          export PRECISION_LOCK_PATH="${PRIVATE_DIR}/scan.lock"
+          export PRECISION_YEAR=2026
+          export PRECISION_API_INTERVAL_SECONDS=1.2
+          export PRECISION_HTTP_TIMEOUT=90
+          python -m classifier.precision_worker --scan-only
+          python - "${SCAN_STATUS}" <<'PY'
+          import json, sys
+          status = json.load(open(sys.argv[1]))
+          queue = status.get("queue") or {}
+          total = int(status.get("plan_total", -1))
+          safe = int(queue.get("pending", 0)) + int(queue.get("verified", 0))
+          if total <= 0 or status.get("discovered") != total or status.get("undiscovered") != 0:
+              raise SystemExit("plan discovery audit failed")
+          if status.get("scan_complete") is not True or status.get("scan_incomplete") is not False:
+              raise SystemExit("plan scan is incomplete")
+          if safe != total or sum(int(value) for value in queue.values()) != total:
+              raise SystemExit("plan queue is not terminal-safe")
+          PY
+
+      - name: Publish a draft plan PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          branch="q1-activity-plan-${GITHUB_RUN_ID}"
+          git switch --create "${branch}"
+          cp "${PUBLIC_ALLOWLIST}" classifier/data/precision-2026.allowlist
+          cp "${PUBLIC_TAXONOMY}" classifier/data/precision-2026-taxonomy.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add classifier/data/precision-2026.allowlist classifier/data/precision-2026-taxonomy.json
+          git commit -m "Prepare Q1 2026 category assignments"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)"             push origin "HEAD:refs/heads/${branch}"
+          accepted="$(python - "${PRIVATE_STATUS}" <<'PY'
+          import json, sys
+          stats = json.load(open(sys.argv[1]))["stats"]
+          print(stats["accepted_full_pair"] + stats["accepted_category_only"])
+          PY
+          )"
+          gh pr create --draft --base main --head "${branch}"             --title "Prepare Q1 2026 category assignments"             --body "Read-only preparation for deals created from 2026-01-01 through 2026-03-31. Accepted assignments: ${accepted}. Excluded stages and live taxonomy validation remain enforced. No CRM writes were performed by this workflow."
