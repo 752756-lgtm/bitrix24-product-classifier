@@ -1,6 +1,7 @@
 name: Prepare Q1 2026 activity plan once
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -41,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          test "${GITHUB_EVENT_NAME}" = "push"
+          case "${GITHUB_EVENT_NAME}" in push|workflow_dispatch) ;; *) exit 1 ;; esac
           test "${GITHUB_REF}" = "refs/heads/main"
           test -n "${BITRIX_WEBHOOK_URL}"
           test -n "${OPENAI_API_KEY}"
@@ -95,10 +96,12 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       - name: Prepare January through March without CRM writes
+        id: prepare
         shell: bash
         run: |
           set -Eeuo pipefail
           umask 077
+          set +e
           python - <<'PY'
           import copy
           import sys
@@ -133,14 +136,34 @@ jobs:
           ]
           module.main()
           PY
+          rc=$?
+          set -e
+          if [ "${rc}" -ne 0 ]; then
+            code="$(python - "${PRIVATE_DIAGNOSTICS}" <<'PY'
+          import json, sys
+          try:
+              print(json.load(open(sys.argv[1])).get("failure_code", ""))
+          except Exception:
+              print("")
+          PY
+          )"
+            if [ "${code}" = "no_safe_rows" ]; then
+              echo "no_rows=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            exit "${rc}"
+          fi
+          echo "no_rows=false" >> "${GITHUB_OUTPUT}"
 
       - name: Generate signed writer assets
+        if: steps.prepare.outputs.no_rows != 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
           python -m tools.generate_precision_plan_assets             --plan "${PRIVATE_PLAN}"             --products "${PRIVATE_PRODUCTS}"             --allowlist "${PUBLIC_ALLOWLIST}"             --taxonomy "${PUBLIC_TAXONOMY}"             --year 2026
 
       - name: Verify every planned row is discoverable
+        if: steps.prepare.outputs.no_rows != 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -169,6 +192,7 @@ jobs:
           PY
 
       - name: Publish a draft plan PR
+        if: steps.prepare.outputs.no_rows != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -190,3 +214,14 @@ jobs:
           PY
           )"
           gh pr create --draft --base main --head "${branch}"             --title "Prepare Q1 2026 category assignments"             --body "Read-only preparation for deals created from 2026-01-01 through 2026-03-31. Accepted assignments: ${accepted}. Excluded stages and live taxonomy validation remain enforced. No CRM writes were performed by this workflow."
+
+      - name: Stop the Q1 chain when no safe rows remain
+        if: steps.prepare.outputs.no_rows == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          marker='classifier/data/q1-2026-backfill-active'
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${marker}" --jq .sha)"
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/contents/${marker}"             -f message='Complete Q1 2026 category preparation'             -f sha="${sha}"             -f branch=main >/dev/null
