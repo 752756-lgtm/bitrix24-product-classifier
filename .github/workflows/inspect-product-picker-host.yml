@@ -1,0 +1,57 @@
+name: Inspect product picker host (read only)
+
+on:
+  push:
+    branches: [codex/email-product-picker]
+    paths:
+      - .github/workflows/inspect-product-picker-host.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: github.repository == '752756-lgtm/bitrix24-product-classifier'
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 3
+    steps:
+      - name: Check host readiness without changing services
+        shell: bash
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          CSCART_API_EMAIL: ${{ secrets.CSCART_API_EMAIL }}
+          CSCART_API_KEY: ${{ secrets.CSCART_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PICKER_WEBHOOK_SECRET: ${{ secrets.PICKER_WEBHOOK_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import json, os, shutil, socket, subprocess
+          def listening(port):
+              try:
+                  with socket.create_connection(('127.0.0.1', port), timeout=1):
+                      return True
+              except OSError:
+                  return False
+          host = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=5)
+          docker = shutil.which('docker') is not None
+          accessible = False
+          if docker:
+              probe = subprocess.run(['docker', 'info'], capture_output=True, timeout=15)
+              accessible = probe.returncode == 0
+          result = {
+              'target_ip_present': '5.129.223.80' in host.stdout.split(),
+              'docker_installed': docker,
+              'docker_accessible': accessible,
+              'port_8091_listening': listening(8091),
+              'port_80_listening': listening(80),
+              'port_443_listening': listening(443),
+              'secrets_present': {key: bool(os.environ.get(key)) for key in [
+                  'BITRIX_WEBHOOK_URL', 'CSCART_API_EMAIL', 'CSCART_API_KEY',
+                  'OPENAI_API_KEY', 'PICKER_WEBHOOK_SECRET']},
+          }
+          print(json.dumps(result, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('Read-only readiness check; no services or files changed.\n\n')
+              f.write('```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
